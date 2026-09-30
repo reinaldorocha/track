@@ -4,6 +4,7 @@ import { dispatchNavigationToCapi } from '@/lib/meta/capi-service'
 
 export async function POST(req: Request) {
   try {
+    const { searchParams } = new URL(req.url)
     const body = await req.json()
     const {
       sessionId,
@@ -16,6 +17,8 @@ export async function POST(req: Request) {
       contentIds,
       sourceUrl
     } = body
+
+    const pixelId = body.pixelId || searchParams.get('pixelId') || searchParams.get('pixel_id') || undefined
 
     if (!eventId || !workspaceId || !eventName) {
       return NextResponse.json({ error: 'Missing required fields' }, { status: 400 })
@@ -31,9 +34,21 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: 'Invalid workspace' }, { status: 400 })
     }
 
-    const session = await prisma.trackingSession.findUnique({
+    let resolvedPixelDbId: string | null = null
+    if (pixelId) {
+      const px = await prisma.pixel.findFirst({
+        where: {
+          workspaceId: workspace.id,
+          status: 'active',
+          OR: [{ id: pixelId }, { pixelId: pixelId }]
+        }
+      })
+      if (px) resolvedPixelDbId = px.id
+    }
+
+    const session = sessionId ? await prisma.trackingSession.findUnique({
       where: { sessionId }
-    })
+    }) : null
 
     if (!session) {
       // Create a dummy session or just ignore the event? We will ignore it for now or log it loosely.
@@ -50,12 +65,13 @@ export async function POST(req: Request) {
         data: {
           eventId,
           workspaceId: workspace.id,
+          pixelId: resolvedPixelDbId,
           sessionId,
           eventName,
           value: value ? parseFloat(value) : null,
           currency,
           orderId,
-          contentIds: contentIds ? JSON.stringify(contentIds) : null,
+          contentIds: contentIds ? (typeof contentIds === 'string' ? contentIds : JSON.stringify(contentIds)) : null,
           sourceUrl,
           status: 'received',
           eventTime: new Date()
@@ -63,24 +79,29 @@ export async function POST(req: Request) {
       })
 
       // Disparo para Meta CAPI (PageView, InitiateCheckout, Lead, etc.)
-      const clientIp = req.headers.get('x-forwarded-for')?.split(',')[0]?.trim() || req.headers.get('x-real-ip') || undefined
-      const clientUserAgent = req.headers.get('user-agent') || undefined
+      // NOTA: Eventos 'Purchase' do navegador NÃO são reenviados aqui via CAPI
+      // para evitar duplicidade de compra com o webhook do gateway que já dispara o CAPI oficial.
+      if (eventName !== 'Purchase') {
+        const clientIp = req.headers.get('x-forwarded-for')?.split(',')[0]?.trim() || req.headers.get('x-real-ip') || undefined
+        const clientUserAgent = req.headers.get('user-agent') || undefined
 
-      try {
-        await dispatchNavigationToCapi({
-          workspaceId: workspace.id,
-          sessionId,
-          eventName,
-          eventId,
-          sourceUrl,
-          value: value ? parseFloat(value) : undefined,
-          currency,
-          contentIds: contentIds ? JSON.stringify(contentIds) : undefined,
-          clientIp,
-          clientUserAgent
-        })
-      } catch (err: unknown) {
-        console.error('[Tracking Event] CAPI dispatch error:', err)
+        try {
+          await dispatchNavigationToCapi({
+            workspaceId: workspace.id,
+            sessionId,
+            eventName,
+            eventId,
+            sourceUrl,
+            value: value ? parseFloat(value) : undefined,
+            currency,
+            contentIds: contentIds ? (typeof contentIds === 'string' ? contentIds : JSON.stringify(contentIds)) : undefined,
+            clientIp,
+            clientUserAgent,
+            pixelId
+          })
+        } catch (err: unknown) {
+          console.error('[Tracking Event] CAPI dispatch error:', err)
+        }
       }
     }
 

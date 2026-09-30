@@ -1,23 +1,31 @@
 ;(function() {
   'use strict';
   
-  // Obter configurações a partir dos atributos da tag script
-  var script = document.currentScript || (function() {
-    var scripts = document.getElementsByTagName('script');
-    return scripts[scripts.length - 1];
-  })();
-  
-  var config = {
-    apiUrl: (script && script.getAttribute('data-api-url')) || '',
-    workspaceId: (script && script.getAttribute('data-workspace-id')) || ''
-  };
-  
-  if (!config.apiUrl || !config.workspaceId) return;
-  
   function getParam(name) {
     var match = RegExp('[?&]' + name + '=([^&]*)').exec(window.location.search);
     return match && decodeURIComponent(match[1].replace(/\+/g, ' '));
   }
+
+  // Obter configurações a partir dos atributos da tag script, meta tags ou variáveis globais
+  var script = document.currentScript || (function() {
+    var scripts = document.getElementsByTagName('script');
+    return scripts[scripts.length - 1];
+  })();
+
+  var metaPixelTag = typeof document !== 'undefined' && document.querySelector ? document.querySelector('meta[name="utmtrack-pixel"], meta[name="meta-pixel-id"]') : null;
+  
+  var config = {
+    apiUrl: (script && script.getAttribute('data-api-url')) || '',
+    workspaceId: (script && script.getAttribute('data-workspace-id')) || '',
+    pixelId: (script && (script.getAttribute('data-pixel-id') || script.getAttribute('data-pixel'))) ||
+             (metaPixelTag && metaPixelTag.getAttribute('content')) ||
+             (typeof window !== 'undefined' && (window.UTM_TRACK_PIXEL_ID || window.UTM_PIXEL_ID)) ||
+             getParam('pixel_id') ||
+             getParam('pixelId') ||
+             ''
+  };
+  
+  if (!config.apiUrl || !config.workspaceId) return;
   
   function getCookie(name) {
     var match = document.cookie.match(new RegExp('(^| )' + name + '=([^;]+)'));
@@ -105,10 +113,15 @@
   }
 
   // Disparo sincronizado com Meta Pixel no Navegador (se instalado) com o MESMO event_id
-  function fireBrowserPixel(eventName, customData, eventId) {
+  function fireBrowserPixel(eventName, customData, eventId, targetPixel) {
     try {
       if (typeof window.fbq === 'function') {
-        window.fbq('track', eventName, customData || {}, { eventID: eventId });
+        var px = targetPixel || config.pixelId;
+        if (px) {
+          window.fbq('trackSingle', px, eventName, customData || {}, { eventID: eventId });
+        } else {
+          window.fbq('track', eventName, customData || {}, { eventID: eventId });
+        }
       }
     } catch(e) {}
   }
@@ -264,6 +277,7 @@
   send('/api/tracking/event', {
     sessionId: sessionId,
     workspaceId: config.workspaceId,
+    pixelId: config.pixelId || undefined,
     eventName: 'PageView',
     eventId: pageViewEventId,
     sourceUrl: location.href
@@ -291,6 +305,7 @@
       send('/api/tracking/event', {
         sessionId: sessionId,
         workspaceId: config.workspaceId,
+        pixelId: config.pixelId || undefined,
         eventName: 'InitiateCheckout',
         eventId: icEventId,
         sourceUrl: location.href,
@@ -328,6 +343,7 @@
           send('/api/tracking/event', {
             sessionId: sessionId,
             workspaceId: config.workspaceId,
+            pixelId: config.pixelId || undefined,
             eventName: 'Purchase',
             eventId: purchaseEventId,
             orderId: orderId,
@@ -345,10 +361,12 @@
     track: function(eventName, data) {
       data = data || {};
       var customEventId = genEventId();
-      fireBrowserPixel(eventName, data, customEventId);
+      var targetPixel = data.pixelId || config.pixelId || undefined;
+      fireBrowserPixel(eventName, data, customEventId, targetPixel);
       send('/api/tracking/event', Object.assign({}, data, {
         sessionId: sessionId,
         workspaceId: config.workspaceId,
+        pixelId: targetPixel,
         eventName: eventName,
         eventId: customEventId,
         sourceUrl: location.href
@@ -361,17 +379,19 @@
       var purchaseEventId = orderId ? ('purchase_' + orderId) : genEventId();
       var val = Number(data.value || data.amount || getParam('value') || 0);
       var curr = data.currency || getParam('currency') || 'BRL';
+      var targetPixel = data.pixelId || config.pixelId || undefined;
 
       fireBrowserPixel('Purchase', {
         value: val,
         currency: curr,
         order_id: orderId || undefined,
         content_type: 'product'
-      }, purchaseEventId);
+      }, purchaseEventId, targetPixel);
 
       send('/api/tracking/event', {
         sessionId: sessionId,
         workspaceId: config.workspaceId,
+        pixelId: targetPixel,
         eventName: 'Purchase',
         eventId: purchaseEventId,
         orderId: orderId || undefined,
@@ -383,6 +403,7 @@
     },
     decorateUrl: decorateUrl,
     sessionId: sessionId,
-    visitorId: visitorId
+    visitorId: visitorId,
+    pixelId: config.pixelId
   };
 })();

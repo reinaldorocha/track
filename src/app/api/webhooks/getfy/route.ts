@@ -10,6 +10,7 @@ import {
   upsertSale 
 } from '@/lib/integrations/normalizer'
 import { createSaleNotification, SaleNotificationType } from '@/lib/notifications/service'
+import { authenticateWebhook } from '@/lib/integrations/webhook-auth'
 
 export async function POST(req: Request) {
   let webhookEventId: string | null = null
@@ -22,12 +23,18 @@ export async function POST(req: Request) {
     const bearerToken = authHeader.toLowerCase().startsWith('bearer ') ? authHeader.slice(7).trim() : null
     const token = searchParams.get('token') || searchParams.get('signature') || req.headers.get('x-getfy-signature') || bearerToken
 
-    const expectedSecret = process.env.GETFY_WEBHOOK_SECRET
-    if (expectedSecret) {
-      if (!token || token !== expectedSecret) {
-        return NextResponse.json({ error: 'Unauthorized: missing or invalid webhook token' }, { status: 401 })
-      }
+    const authResult = await authenticateWebhook({
+      platform: 'getfy',
+      providedToken: token,
+      queryWorkspaceId: queryWs,
+      globalEnvSecret: process.env.GETFY_WEBHOOK_SECRET
+    })
+
+    if (!authResult.authorized) {
+      return NextResponse.json({ error: authResult.error }, { status: authResult.status })
     }
+
+    const workspaceId = authResult.workspaceId!
 
     const rawBody = await req.json().catch(() => null)
     if (!rawBody) {
@@ -43,28 +50,6 @@ export async function POST(req: Request) {
     const product = (envelopePayload.product as Record<string, unknown>) || (envelopePayload.offer as Record<string, unknown>) || {}
 
     const orderId = String(order.id || envelopePayload.order_id || envelopePayload.orderId || envelopePayload.id || `GETFY_${Date.now()}`)
-
-    let workspaceId: string | null | undefined = null
-    if (queryWs) {
-      const validWs = await prisma.workspace.findUnique({ where: { id: queryWs } })
-      if (!validWs) {
-        return NextResponse.json({ error: 'Invalid workspaceId' }, { status: 404 })
-      }
-      workspaceId = validWs.id
-    }
-
-    if (!workspaceId) {
-      const integration = await prisma.integration.findFirst({
-        where: { platform: 'getfy' }
-      })
-      workspaceId = integration?.workspaceId
-    }
-
-    if (!workspaceId) {
-      const defaultWs = await prisma.workspace.findFirst({ orderBy: { createdAt: 'asc' } })
-      if (!defaultWs) return NextResponse.json({ error: 'Workspace not found' }, { status: 404 })
-      workspaceId = defaultWs.id
-    }
 
     const status = normalizeSaleStatus(event, 'getfy')
     const grossPrice = normalizeSaleAmount(envelopePayload, 'getfy')

@@ -85,7 +85,26 @@ export default function IntegrationsHubPage() {
     queryFn: () => fetch("/api/events?limit=5").then((r) => r.json()),
   });
 
+  const { data: productsData } = useQuery({
+    queryKey: ["products"],
+    queryFn: () => fetch("/api/products").then((r) => r.json()),
+  });
+
   // Mutações
+  const updateProductPixelMutation = useMutation({
+    mutationFn: async ({ productId, pixelId }: { productId: string; pixelId: string | null }) => {
+      const res = await fetch("/api/products", {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ productId, pixelId }),
+      });
+      if (!res.ok) throw new Error("Erro ao atualizar vínculo do produto com o pixel");
+      return res.json();
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["products"] });
+    },
+  });
   const savePixelMutation = useMutation({
     mutationFn: async (body: typeof pixelForm) => {
       const res = await fetch("/api/pixels", {
@@ -269,6 +288,7 @@ export default function IntegrationsHubPage() {
   const appUrl = typeof window !== "undefined" ? window.location.origin : "https://utm-track-navy.vercel.app";
   const connectedAccountsCount = adAccountsData?.accounts?.length || 0;
   const pixels = pixelsData?.pixels || [];
+  const products = productsData?.products || [];
   const genericEndpoints = genericEndpointsData?.endpoints || [];
 
   const tabs: Array<"ANÚNCIOS" | "WEBHOOKS" | "UTMs" | "PIXEL" | "TESTES" | "INSPETOR"> = [
@@ -1047,6 +1067,85 @@ export default function IntegrationsHubPage() {
               ))}
             </div>
           )}
+
+          {/* Mapeamento de Produtos para Pixels (Multi-Pixel Routing) */}
+          <div className="bg-white dark:bg-[#081A33] border border-slate-200/90 dark:border-[#142C52] rounded-xl p-5 shadow-sm space-y-4">
+            <div className="flex items-center justify-between">
+              <div>
+                <h3 className="text-sm font-bold text-slate-900 dark:text-white flex items-center gap-2">
+                  <ShoppingBag className="w-4 h-4 text-blue-500" />
+                  Roteamento de Pixel por Produto (Multi-Produto & Multi-Campanha)
+                </h3>
+                <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
+                  Vincule cada produto ao seu respectivo Pixel da Meta. Garante que vendas de campanhas diferentes sejam enviadas estritamente ao Pixel correto, sem ambiguidades.
+                </p>
+              </div>
+            </div>
+
+            {products.length === 0 ? (
+              <div className="text-center py-6 text-slate-400 text-xs bg-slate-50/50 dark:bg-[#0E2442]/30 rounded-lg border border-dashed border-slate-200 dark:border-[#1E3E6B]">
+                Nenhum produto cadastrado ainda. Quando suas vendas chegarem via Webhook ou você cadastrar um produto, ele aparecerá aqui para ser vinculado a um Pixel.
+              </div>
+            ) : (
+              <div className="overflow-x-auto border border-slate-100 dark:border-[#142C52] rounded-lg">
+                <table className="w-full text-left text-xs">
+                  <thead className="bg-slate-50 dark:bg-[#0E2442] text-slate-500 dark:text-slate-400 font-semibold border-b border-slate-200 dark:border-[#142C52]">
+                    <tr>
+                      <th className="py-2.5 px-3">Produto</th>
+                      <th className="py-2.5 px-3">Plataforma</th>
+                      <th className="py-2.5 px-3">Preço</th>
+                      <th className="py-2.5 px-3">Pixel Vinculado</th>
+                      <th className="py-2.5 px-3">Status</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-100 dark:divide-[#142C52]">
+                    {products.map((prod: any) => (
+                      <tr key={prod.id} className="hover:bg-slate-50/50 dark:hover:bg-[#0E2442]/30">
+                        <td className="py-3 px-3 font-medium text-slate-900 dark:text-white">
+                          {prod.name}
+                          {prod.externalId && (
+                            <span className="block text-[10px] text-slate-400 font-mono">ID: {prod.externalId}</span>
+                          )}
+                        </td>
+                        <td className="py-3 px-3 uppercase text-[11px] font-bold text-slate-500">
+                          {prod.platform || 'Genérico'}
+                        </td>
+                        <td className="py-3 px-3 font-semibold text-slate-700 dark:text-slate-200">
+                          {prod.price ? formatCurrency(prod.price) : '—'}
+                        </td>
+                        <td className="py-3 px-3">
+                          <select
+                            value={prod.pixelId || ""}
+                            onChange={(e) => updateProductPixelMutation.mutate({ productId: prod.id, pixelId: e.target.value || null })}
+                            disabled={updateProductPixelMutation.isPending}
+                            className="bg-white dark:bg-[#0E2442] border border-slate-300 dark:border-[#1E3E6B] rounded-lg px-2.5 py-1 text-xs text-slate-800 dark:text-slate-100 focus:ring-2 focus:ring-blue-500 outline-none"
+                          >
+                            <option value="">Nenhum (Fallback seguro se único)</option>
+                            {pixels.map((pix: any) => (
+                              <option key={pix.id} value={pix.id}>
+                                {pix.name} ({pix.pixelId})
+                              </option>
+                            ))}
+                          </select>
+                        </td>
+                        <td className="py-3 px-3">
+                          {prod.pixelId ? (
+                            <span className="inline-flex items-center gap-1 text-[11px] text-emerald-600 dark:text-emerald-400 font-medium">
+                              <CheckCircle2 className="w-3.5 h-3.5" /> Vinculado
+                            </span>
+                          ) : (
+                            <span className="inline-flex items-center gap-1 text-[11px] text-amber-500 font-medium">
+                              <AlertCircle className="w-3.5 h-3.5" /> Não vinculado
+                            </span>
+                          )}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
 
           {/* Modal Adicionar / Configurar Pixel */}
           {isPixelModalOpen && (

@@ -9,39 +9,34 @@ import {
   upsertSale 
 } from '@/lib/integrations/normalizer'
 import { createSaleNotification, SaleNotificationType } from '@/lib/notifications/service'
+import { authenticateWebhook } from '@/lib/integrations/webhook-auth'
 
 export async function POST(req: Request) {
   try {
-    const authHeader = req.headers.get('Authorization')
-    if (process.env.YAMPI_WEBHOOK_SECRET && authHeader) {
-      const token = authHeader.replace('Bearer ', '')
-      if (token !== process.env.YAMPI_WEBHOOK_SECRET) {
-        return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-      }
-    }
-
     const { searchParams } = new URL(req.url)
     const queryWs = searchParams.get('workspaceId') || searchParams.get('workspace_id') || req.headers.get('x-workspace-id')
+
+    const authHeader = req.headers.get('Authorization')
+    const token = authHeader ? authHeader.replace(/^Bearer\s+/i, '').trim() : (searchParams.get('token') || searchParams.get('signature'))
+
+    const authResult = await authenticateWebhook({
+      platform: 'yampi',
+      providedToken: token,
+      queryWorkspaceId: queryWs,
+      globalEnvSecret: process.env.YAMPI_WEBHOOK_SECRET
+    })
+
+    if (!authResult.authorized) {
+      return NextResponse.json({ error: authResult.error }, { status: authResult.status })
+    }
+
+    const workspaceId = authResult.workspaceId!
 
     const body = await req.json()
     const order = body.resource || body
 
     if (!order) {
       return NextResponse.json({ error: 'Invalid payload' }, { status: 400 })
-    }
-
-    let workspaceId: string | null | undefined = queryWs
-    if (!workspaceId) {
-      const integration = await prisma.integration.findFirst({
-        where: { platform: 'yampi' }
-      })
-      workspaceId = integration?.workspaceId
-    }
-
-    if (!workspaceId) {
-      const defaultWs = await prisma.workspace.findFirst({ orderBy: { createdAt: 'asc' } })
-      if (!defaultWs) return NextResponse.json({ error: 'Workspace not found' }, { status: 404 })
-      workspaceId = defaultWs.id
     }
 
     const alias = String(order.status?.alias || order.status || 'unknown')

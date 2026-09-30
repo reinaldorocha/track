@@ -10,6 +10,7 @@ import {
   upsertSale 
 } from '@/lib/integrations/normalizer'
 import { createSaleNotification, SaleNotificationType } from '@/lib/notifications/service'
+import { authenticateWebhook } from '@/lib/integrations/webhook-auth'
 
 export async function POST(req: Request) {
   let webhookEventId: string | null = null
@@ -18,13 +19,18 @@ export async function POST(req: Request) {
     const queryWs = searchParams.get('workspaceId') || searchParams.get('workspace_id') || req.headers.get('x-workspace-id')
     const token = searchParams.get('token') || searchParams.get('signature') || req.headers.get('x-kiwify-signature')
 
-    const expectedSecret = process.env.KIWIFY_WEBHOOK_SECRET
-    // Se o segredo está configurado, o token é estritamente OBRIGATÓRIO e deve bater
-    if (expectedSecret) {
-      if (!token || token !== expectedSecret) {
-        return NextResponse.json({ error: 'Unauthorized: missing or invalid webhook signature/token' }, { status: 401 })
-      }
+    const authResult = await authenticateWebhook({
+      platform: 'kiwify',
+      providedToken: token,
+      queryWorkspaceId: queryWs,
+      globalEnvSecret: process.env.KIWIFY_WEBHOOK_SECRET
+    })
+
+    if (!authResult.authorized) {
+      return NextResponse.json({ error: authResult.error }, { status: authResult.status })
     }
+
+    const workspaceId = authResult.workspaceId!
 
     const payload = await req.json().catch(() => null)
     if (!payload) {
@@ -33,28 +39,6 @@ export async function POST(req: Request) {
 
     const orderId = String(payload.order_id || payload.orderId || payload.id || `KIWIFY_${Date.now()}`)
     const rawStatus = String(payload.order_status || payload.status || 'paid')
-
-    let workspaceId: string | null | undefined = null
-    if (queryWs) {
-      const validWs = await prisma.workspace.findUnique({ where: { id: queryWs } })
-      if (!validWs) {
-        return NextResponse.json({ error: 'Invalid workspaceId' }, { status: 404 })
-      }
-      workspaceId = validWs.id
-    }
-
-    if (!workspaceId) {
-      const integration = await prisma.integration.findFirst({
-        where: { platform: 'kiwify' }
-      })
-      workspaceId = integration?.workspaceId
-    }
-
-    if (!workspaceId) {
-      const defaultWs = await prisma.workspace.findFirst({ orderBy: { createdAt: 'asc' } })
-      if (!defaultWs) return NextResponse.json({ error: 'Workspace not found' }, { status: 404 })
-      workspaceId = defaultWs.id
-    }
 
     const status = normalizeSaleStatus(rawStatus, 'kiwify')
     const grossPrice = normalizeSaleAmount(payload, 'kiwify')

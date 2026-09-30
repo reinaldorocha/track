@@ -9,19 +9,29 @@ import {
   upsertSale 
 } from '@/lib/integrations/normalizer'
 import { createSaleNotification, SaleNotificationType } from '@/lib/notifications/service'
+import { authenticateWebhook } from '@/lib/integrations/webhook-auth'
 
 export async function POST(req: Request) {
   try {
-    const signature = req.headers.get('x-cakto-signature') || req.headers.get('x-cacto-signature') || req.headers.get('Authorization')
-    const secret = process.env.CAKTO_WEBHOOK_SECRET || process.env.CACTO_WEBHOOK_SECRET
-    if (secret) {
-      if (!signature || (signature !== secret && signature !== `Bearer ${secret}`)) {
-        return NextResponse.json({ error: 'Unauthorized: missing or invalid signature' }, { status: 401 })
-      }
-    }
-
     const { searchParams } = new URL(req.url)
     const queryWs = searchParams.get('workspaceId') || searchParams.get('workspace_id') || req.headers.get('x-workspace-id')
+
+    const authHeader = req.headers.get('Authorization')
+    const bearer = authHeader?.toLowerCase().startsWith('bearer ') ? authHeader.slice(7).trim() : authHeader
+    const signature = req.headers.get('x-cakto-signature') || req.headers.get('x-cacto-signature') || searchParams.get('token') || searchParams.get('signature') || bearer
+
+    const authResult = await authenticateWebhook({
+      platform: 'cakto',
+      providedToken: signature,
+      queryWorkspaceId: queryWs,
+      globalEnvSecret: process.env.CAKTO_WEBHOOK_SECRET || process.env.CACTO_WEBHOOK_SECRET
+    })
+
+    if (!authResult.authorized) {
+      return NextResponse.json({ error: authResult.error }, { status: authResult.status })
+    }
+
+    const workspaceId = authResult.workspaceId!
 
     const body = await req.json()
     const id = body.id || body.data?.id || body.data?.transaction?.id || body.transaction_id || body.order_id
@@ -29,28 +39,6 @@ export async function POST(req: Request) {
 
     if (!id) {
       return NextResponse.json({ error: 'Invalid payload: missing transaction id' }, { status: 400 })
-    }
-
-    let workspaceId: string | null | undefined = null
-    if (queryWs) {
-      const validWs = await prisma.workspace.findUnique({ where: { id: queryWs } })
-      if (!validWs) {
-        return NextResponse.json({ error: 'Invalid workspaceId' }, { status: 404 })
-      }
-      workspaceId = validWs.id
-    }
-
-    if (!workspaceId) {
-      const integration = await prisma.integration.findFirst({
-        where: { platform: { in: ['cakto', 'cacto'] } }
-      })
-      workspaceId = integration?.workspaceId
-    }
-
-    if (!workspaceId) {
-      const defaultWs = await prisma.workspace.findFirst({ orderBy: { createdAt: 'asc' } })
-      if (!defaultWs) return NextResponse.json({ error: 'Workspace not found' }, { status: 404 })
-      workspaceId = defaultWs.id
     }
 
     const status = normalizeSaleStatus(rawStatus, 'cakto')
