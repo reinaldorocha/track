@@ -1416,4 +1416,193 @@ describe('Automação CAPI, Decoração Real de Checkout, Roteamento por Produto
       }
     }
   })
+
+  // 24. Pixel A vinculado inativo + somente Pixel B ativo no workspace: tanto envio inicial quanto retry devem falhar com 0 chamadas à Meta (NUNCA fazer fallback para o Pixel B ativo)
+  it('24. Pixel A vinculado inativo + somente Pixel B ativo no workspace: tanto envio inicial quanto retry devem falhar com 0 chamadas à Meta (NUNCA fazer fallback para o Pixel B ativo)', async () => {
+    let metaCalls = 0
+    const calledUrls: string[] = []
+    const originalFetch = global.fetch
+    global.fetch = async (url: any) => {
+      metaCalls++
+      calledUrls.push(String(url))
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ events_received: 1 })
+      } as any
+    }
+
+    let isoWsId: string | null = null
+    const orderInitId = `ISO_INIT_${Date.now()}`
+    const orderRetryDirectId = `ISO_RETRY_DIRECT_${Date.now()}`
+    const orderRetrySaleId = `ISO_RETRY_SALE_${Date.now()}`
+
+    try {
+      // 1. Criar workspace isolado com exatamente 1 pixel inativo e 1 pixel ativo
+      const isoWs = await prisma.workspace.create({
+        data: {
+          name: 'Workspace Inactive Fallback Isolation',
+          slug: `iso-fallback-${Date.now()}`
+        }
+      })
+      isoWsId = isoWs.id
+
+      // Pixel A (Inativo)
+      const pixelA = await prisma.pixel.create({
+        data: {
+          workspaceId: isoWs.id,
+          name: 'Pixel A Inativo',
+          pixelId: '888888888888888',
+          accessTokenEnc: encrypt('EAABmocktokenA'),
+          status: 'inactive'
+        }
+      })
+
+      // Pixel B (Único Pixel Ativo no Workspace)
+      const pixelB = await prisma.pixel.create({
+        data: {
+          workspaceId: isoWs.id,
+          name: 'Pixel B Unico Ativo',
+          pixelId: '777777777777777',
+          accessTokenEnc: encrypt('EAABmocktokenB'),
+          status: 'active'
+        }
+      })
+
+      // Produto A vinculado explicitamente ao Pixel A (que está inativo)
+      const productA = await prisma.product.create({
+        data: {
+          workspaceId: isoWs.id,
+          name: 'Produto A Vinculado a Pixel Inativo',
+          price: 297,
+          pixelId: pixelA.id
+        }
+      })
+
+      // Venda vinculada ao Produto A (para teste de retry via items da venda)
+      await prisma.sale.create({
+        data: {
+          workspaceId: isoWs.id,
+          externalId: orderRetrySaleId,
+          platform: 'kiwify',
+          status: 'approved',
+          grossAmount: 297,
+          netAmount: 270,
+          orderedAt: new Date(),
+          approvedAt: new Date(),
+          items: {
+            create: [{
+              name: 'Item Produto A',
+              productId: productA.id,
+              quantity: 1,
+              unitPrice: 297,
+              totalPrice: 297
+            }]
+          }
+        }
+      })
+
+      // ==========================================
+      // PARTE 1: Envio Inicial (dispatchPurchaseToCapi)
+      // ==========================================
+      const resInitial = await dispatchPurchaseToCapi({
+        workspaceId: isoWs.id,
+        saleId: `sale_${orderInitId}`,
+        externalId: orderInitId,
+        grossAmount: 297,
+        productId: productA.id,
+        customerEmail: 'cliente_inicial@teste.com'
+      })
+
+      assert.equal(resInitial.sent, false, 'Envio inicial não deve ser transmitido quando o pixel vinculado ao produto estiver inativo')
+      assert.equal(resInitial.success, false)
+      assert.equal(resInitial.reason, 'pixel_inactive_or_missing')
+      assert.equal(metaCalls, 0, 'Envio inicial com pixel vinculado inativo DEVE resultar em 0 chamadas à Meta (Pixel B ativo NÃO deve ser usado como fallback)')
+
+      const initEventId = buildPurchaseEventId(isoWs.id, orderInitId, undefined)
+      const dbInitEvt = await prisma.trackingEvent.findUnique({
+        where: { eventId: initEventId }
+      })
+      assert.equal(dbInitEvt?.status, 'failed', 'Evento de envio inicial deve ser gravado com status failed')
+      assert.ok(
+        String(dbInitEvt?.capiError).includes('inativo'),
+        'Erro gravado no evento inicial deve apontar que o pixel vinculado está inativo'
+      )
+
+      // ==========================================
+      // PARTE 2: Retry via pixelId direto no evento
+      // ==========================================
+      const eventRetryDirectId = buildPurchaseEventId(isoWs.id, orderRetryDirectId, 'kiwify')
+      await prisma.trackingEvent.create({
+        data: {
+          eventId: eventRetryDirectId,
+          workspaceId: isoWs.id,
+          pixelId: pixelA.id, // Pixel A inativo
+          eventName: 'Purchase',
+          eventTime: new Date(),
+          orderId: orderRetryDirectId,
+          platform: 'kiwify',
+          value: 297,
+          status: 'failed',
+          retryCount: 0,
+          emailHash: sha256Hash('retry_direct@teste.com')
+        }
+      })
+
+      // ==========================================
+      // PARTE 3: Retry via produto da venda (pixelId: null no evento)
+      // ==========================================
+      const eventRetrySaleId = buildPurchaseEventId(isoWs.id, orderRetrySaleId, 'kiwify')
+      await prisma.trackingEvent.create({
+        data: {
+          eventId: eventRetrySaleId,
+          workspaceId: isoWs.id,
+          pixelId: null, // Sem pixel direto, deve resolver via items -> productA -> pixelA (inativo)
+          eventName: 'Purchase',
+          eventTime: new Date(),
+          orderId: orderRetrySaleId,
+          platform: 'kiwify',
+          value: 297,
+          status: 'failed',
+          retryCount: 0,
+          emailHash: sha256Hash('retry_sale@teste.com')
+        }
+      })
+
+      // Executar a fila de retry
+      await retryFailedCapiEvents(isoWs.id)
+
+      // Verificar que ZERO chamadas foram feitas à Meta durante todo o processo
+      assert.equal(metaCalls, 0, 'Retry DEVE resultar em ZERO chamadas à Meta quando os produtos/eventos estão vinculados a um pixel inativo (Pixel B nunca deve receber)')
+      assert.equal(calledUrls.length, 0, 'Nenhuma URL de Pixel deve ter sido requisitada')
+
+      const dbRetryDirectEvt = await prisma.trackingEvent.findUnique({
+        where: { eventId: eventRetryDirectId }
+      })
+      assert.equal(dbRetryDirectEvt?.status, 'failed', 'Evento de retry direto deve permanecer failed')
+      assert.ok(
+        String(dbRetryDirectEvt?.capiError).includes('inativo'),
+        'Erro do retry direto deve registrar que o pixel explicitamente vinculado está inativo'
+      )
+
+      const dbRetrySaleEvt = await prisma.trackingEvent.findUnique({
+        where: { eventId: eventRetrySaleId }
+      })
+      assert.equal(dbRetrySaleEvt?.status, 'failed', 'Evento de retry resolvido por produto deve permanecer failed')
+      assert.ok(
+        String(dbRetrySaleEvt?.capiError).includes('inativo'),
+        'Erro do retry resolvido por produto deve registrar que o pixel vinculado ao produto está inativo'
+      )
+    } finally {
+      global.fetch = originalFetch
+      if (isoWsId) {
+        await prisma.trackingEvent.deleteMany({ where: { workspaceId: isoWsId } })
+        await prisma.saleItem.deleteMany({ where: { sale: { workspaceId: isoWsId } } })
+        await prisma.sale.deleteMany({ where: { workspaceId: isoWsId } })
+        await prisma.product.deleteMany({ where: { workspaceId: isoWsId } })
+        await prisma.pixel.deleteMany({ where: { workspaceId: isoWsId } })
+        await prisma.workspace.delete({ where: { id: isoWsId } }).catch(() => {})
+      }
+    }
+  })
 })

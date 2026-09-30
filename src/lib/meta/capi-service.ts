@@ -280,26 +280,26 @@ export async function dispatchPurchaseToCapi(params: DispatchPurchaseParams) {
       return { sent: false, success: false, reason: 'pixel_not_configured', error: errorMsg, eventId }
     }
 
-    let pixel: typeof activePixels[0] | null = null
+    let explicitPixelId: string | null = null
 
     // 1.1 Se pixelId for fornecido diretamente
     if (directPixelId) {
-      pixel = activePixels.find(p => p.id === directPixelId || p.pixelId === directPixelId) || null
+      explicitPixelId = directPixelId
     }
 
     // 1.2 Se temos productId, buscar o pixel explicitamente vinculado ao produto
-    if (!pixel && productId) {
+    if (!explicitPixelId && productId) {
       const prod = await prisma.product.findFirst({
         where: { id: productId, workspaceId },
         select: { pixelId: true }
       })
       if (prod?.pixelId) {
-        pixel = activePixels.find(p => p.id === prod.pixelId || p.pixelId === prod.pixelId) || null
+        explicitPixelId = prod.pixelId
       }
     }
 
     // 1.3 Se não encontrou, verificar se a venda tem items com produto vinculado a um pixel
-    if (!pixel && (saleId || externalId)) {
+    if (!explicitPixelId && (saleId || externalId)) {
       let saleWithItem: any = null
       if (platform) {
         saleWithItem = await prisma.sale.findFirst({
@@ -333,14 +333,33 @@ export async function dispatchPurchaseToCapi(params: DispatchPurchaseParams) {
       }
 
       const itemWithPixel = saleWithItem?.items?.find((it: any) => it.product?.pixelId)
-      const targetPixelId = itemWithPixel?.product?.pixelId
-      if (targetPixelId) {
-        pixel = activePixels.find(p => p.id === targetPixelId || p.pixelId === targetPixelId) || null
+      if (itemWithPixel?.product?.pixelId) {
+        explicitPixelId = itemWithPixel.product.pixelId
       }
     }
 
-    // 1.4 Resolução Segura de Fallback:
-    if (!pixel) {
+    let pixel: typeof activePixels[0] | null = null
+
+    if (explicitPixelId) {
+      // Quando existe um vínculo explícito (direto, via produto ou via item da venda),
+      // o pixel DEVE ser exatamente aquele. Se estiver inativo, sem token ou inexistente,
+      // JAMAIS deve fazer fallback para outro pixel ativo do workspace!
+      pixel = activePixels.find(p => p.id === explicitPixelId || p.pixelId === explicitPixelId) || null
+
+      if (!pixel) {
+        const errorMsg = `O pixel explicitamente vinculado (${explicitPixelId}) está inativo, sem access token ou não pertence ao workspace.`
+        console.error(`[CAPI Service] ${errorMsg}`)
+        await recordFailedPurchaseEvent(errorMsg, explicitPixelId)
+        return {
+          sent: false,
+          success: false,
+          reason: 'pixel_inactive_or_missing',
+          error: errorMsg,
+          eventId
+        }
+      }
+    } else {
+      // 1.4 Resolução Segura de Fallback SOMENTE QUANDO NÃO HÁ VÍNCULO EXPLÍCITO:
       if (activePixels.length === 1) {
         pixel = activePixels[0]
       } else {
@@ -711,73 +730,106 @@ export async function retryFailedCapiEvents(workspaceId?: string, limit = 20) {
         continue
       }
 
-      let pixel = evt.pixel
-      // 1.1 Verificar se o pixel previamente associado ainda está ativo e possui access token
-      if (pixel && (pixel.status !== 'active' || !pixel.accessTokenEnc)) {
-        pixel = null
+      let explicitPixelId: string | null = evt.pixelId || null
+
+      // Se não tínhamos pixelId gravado no evento, tentar resolver vínculo explícito via produto da venda
+      if (!explicitPixelId && evt.workspaceId && evt.orderId) {
+        const effectivePlatform = evt.platform || (
+          String(evt.orderId).toUpperCase().startsWith('HP') ? 'hotmart' :
+          String(evt.orderId).toLowerCase().startsWith('kw_') ? 'kiwify' :
+          String(evt.orderId).toLowerCase().startsWith('ck_') ? 'cakto' :
+          undefined
+        )
+
+        let sale: any = null
+        if (effectivePlatform) {
+          sale = await prisma.sale.findFirst({
+            where: {
+              workspaceId: evt.workspaceId,
+              platform: effectivePlatform,
+              OR: [{ id: evt.orderId }, { externalId: evt.orderId }]
+            },
+            include: { items: { include: { product: true } } }
+          })
+        } else {
+          // Sem plataforma conhecida: verificar se há múltiplos pedidos para o mesmo ID entre plataformas distintas
+          const matchingSales = await prisma.sale.findMany({
+            where: {
+              workspaceId: evt.workspaceId,
+              OR: [{ id: evt.orderId }, { externalId: evt.orderId }]
+            },
+            include: { items: { include: { product: true } } },
+            take: 2
+          })
+
+          if (matchingSales.length > 1) {
+            await prisma.trackingEvent.update({
+              where: { id: evt.id },
+              data: {
+                status: 'failed',
+                capiError: 'Resolução ambígua de venda no retry: múltiplos pedidos encontrados com o mesmo ID em plataformas distintas sem plataforma declarada',
+                updatedAt: new Date()
+              }
+            }).catch(() => {})
+            continue
+          }
+
+          sale = matchingSales[0] || null
+        }
+
+        const itemWithPixel = sale?.items?.find((it: any) => it.product?.pixelId)
+        if (itemWithPixel?.product?.pixelId) {
+          explicitPixelId = itemWithPixel.product.pixelId
+        }
       }
 
-      // 1.2 Se não havia pixel associado ou ele foi desativado posteriormente, tentar resolver agora
-      if (!pixel && evt.workspaceId) {
-        if (evt.orderId) {
-          const effectivePlatform = evt.platform || (
-            String(evt.orderId).toUpperCase().startsWith('HP') ? 'hotmart' :
-            String(evt.orderId).toLowerCase().startsWith('kw_') ? 'kiwify' :
-            String(evt.orderId).toLowerCase().startsWith('ck_') ? 'cakto' :
-            undefined
-          )
+      let pixel: any = null
 
-          let sale: any = null
-          if (effectivePlatform) {
-            sale = await prisma.sale.findFirst({
-              where: {
-                workspaceId: evt.workspaceId,
-                platform: effectivePlatform,
-                OR: [{ id: evt.orderId }, { externalId: evt.orderId }]
-              },
-              include: { items: { include: { product: true } } }
-            })
-          } else {
-            // Sem plataforma conhecida: verificar se há múltiplos pedidos para o mesmo ID entre plataformas distintas
-            const matchingSales = await prisma.sale.findMany({
-              where: {
-                workspaceId: evt.workspaceId,
-                OR: [{ id: evt.orderId }, { externalId: evt.orderId }]
-              },
-              include: { items: { include: { product: true } } },
-              take: 2
-            })
-
-            if (matchingSales.length > 1) {
-              await prisma.trackingEvent.update({
-                where: { id: evt.id },
-                data: {
-                  status: 'failed',
-                  capiError: 'Resolução ambígua de venda no retry: múltiplos pedidos encontrados com o mesmo ID em plataformas distintas sem plataforma declarada',
-                  updatedAt: new Date()
-                }
-              }).catch(() => {})
-              continue
-            }
-
-            sale = matchingSales[0] || null
+      if (explicitPixelId) {
+        // Quando existe um vínculo explícito (no evento ou no produto da venda), o reenvio
+        // DEVE usar exatamente esse pixel. Se ele estiver inativo ou sem access token,
+        // o evento DEVE permanecer como failed e NUNCA fazer fallback para outro pixel ativo!
+        pixel = await prisma.pixel.findFirst({
+          where: {
+            workspaceId: evt.workspaceId,
+            status: 'active',
+            accessTokenEnc: { not: null },
+            OR: [
+              { id: explicitPixelId },
+              { pixelId: explicitPixelId }
+            ]
           }
+        })
 
-          const itemWithPixel = sale?.items?.find((it: any) => it.product?.pixelId)
-          const targetPixelId = itemWithPixel?.product?.pixelId
-          if (targetPixelId) {
-            pixel = await prisma.pixel.findFirst({
-              where: { id: targetPixelId, workspaceId: evt.workspaceId, status: 'active', accessTokenEnc: { not: null } }
-            })
-          }
-        }
         if (!pixel) {
-          const activePixels = await prisma.pixel.findMany({
-            where: { workspaceId: evt.workspaceId, status: 'active', accessTokenEnc: { not: null } }
-          })
-          if (activePixels.length === 1) {
-            pixel = activePixels[0]
-          }
+          await prisma.trackingEvent.update({
+            where: { id: evt.id },
+            data: {
+              status: 'failed',
+              capiError: `O pixel explicitamente vinculado (${explicitPixelId}) está inativo, sem token de acesso ou foi desativado durante o retry`,
+              updatedAt: new Date()
+            }
+          }).catch(() => {})
+          continue
+        }
+      } else {
+        // Fallback SOMENTE se NÃO houver vínculo explícito no evento nem no produto da venda
+        const activePixels = await prisma.pixel.findMany({
+          where: { workspaceId: evt.workspaceId, status: 'active', accessTokenEnc: { not: null } }
+        })
+
+        if (activePixels.length === 1) {
+          pixel = activePixels[0]
+        } else {
+          await prisma.trackingEvent.update({
+            where: { id: evt.id },
+            data: {
+              status: 'failed',
+              capiError: `Múltiplos pixels ativos (${activePixels.length}) no workspace sem produto vinculado`,
+              updatedAt: new Date()
+            }
+          }).catch(() => {})
+          continue
         }
       }
 
