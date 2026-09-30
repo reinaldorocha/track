@@ -1,0 +1,16 @@
+services:
+  utm-track:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: utm-track-app
+    restart: always
+    ports:
+      - "127.0.0.1:3000:3000"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    env_file:
+      - .env.production
+    environment:
+      - NODE_ENV=production
+      - PORT=3000
