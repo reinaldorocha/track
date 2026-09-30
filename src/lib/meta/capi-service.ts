@@ -194,6 +194,7 @@ export async function dispatchPurchaseToCapi(params: DispatchPurchaseParams) {
               value: eventValue,
               currency: currency || 'BRL',
               status: 'sending',
+              requestedPixelId: directPixelId ? String(directPixelId) : null,
               sessionId: sessionId || null,
               clientIp: effectiveIp || null,
               clientUserAgent: effectiveUserAgent || null,
@@ -230,12 +231,14 @@ export async function dispatchPurchaseToCapi(params: DispatchPurchaseParams) {
       }
     }
 
-    const recordFailedPurchaseEvent = async (errorMsg: string, pixelDbId?: string | null) => {
+    const recordFailedPurchaseEvent = async (errorMsg: string, pixelDbId?: string | null, targetRequestedPixelId?: string | null) => {
+      const effRequestedPixelId = targetRequestedPixelId !== undefined ? targetRequestedPixelId : (explicitPixelId || (directPixelId ? String(directPixelId) : null))
       try {
         await prisma.trackingEvent.upsert({
           where: { eventId },
           update: {
             pixelId: pixelDbId || undefined,
+            requestedPixelId: effRequestedPixelId || undefined,
             platform: platform || null,
             status: 'failed',
             capiError: errorMsg,
@@ -245,6 +248,7 @@ export async function dispatchPurchaseToCapi(params: DispatchPurchaseParams) {
             eventId,
             workspaceId,
             pixelId: pixelDbId || null,
+            requestedPixelId: effRequestedPixelId || null,
             sessionId: sessionId || null,
             eventName: 'Purchase',
             eventTime: approvedAt || new Date(),
@@ -272,6 +276,7 @@ export async function dispatchPurchaseToCapi(params: DispatchPurchaseParams) {
             where: { eventId },
             update: {
               pixelId: undefined,
+              requestedPixelId: effRequestedPixelId || undefined,
               platform: platform || null,
               status: 'failed',
               capiError: `${errorMsg} (Falha ao vincular pixelId: ${err instanceof Error ? err.message : String(err)})`,
@@ -281,6 +286,7 @@ export async function dispatchPurchaseToCapi(params: DispatchPurchaseParams) {
               eventId,
               workspaceId,
               pixelId: null,
+              requestedPixelId: effRequestedPixelId || null,
               sessionId: sessionId || null,
               eventName: 'Purchase',
               eventTime: approvedAt || new Date(),
@@ -403,7 +409,7 @@ export async function dispatchPurchaseToCapi(params: DispatchPurchaseParams) {
           : `O pixel explicitamente vinculado (${explicitPixelId}) não foi encontrado no workspace.`
 
         console.error(`[CAPI Service] ${errorMsg}`)
-        await recordFailedPurchaseEvent(errorMsg, internalPixelDbId)
+        await recordFailedPurchaseEvent(errorMsg, internalPixelDbId, explicitPixelId)
         return {
           sent: false,
           success: false,
@@ -487,6 +493,7 @@ export async function dispatchPurchaseToCapi(params: DispatchPurchaseParams) {
       where: { eventId },
       update: {
         pixelId: pixel.id,
+        requestedPixelId: explicitPixelId || (directPixelId ? String(directPixelId) : null),
         platform: platform || null,
         status: isSuccess ? 'sent' : 'failed',
         capiResponse: JSON.stringify(capiResult),
@@ -504,6 +511,7 @@ export async function dispatchPurchaseToCapi(params: DispatchPurchaseParams) {
         eventId,
         workspaceId,
         pixelId: pixel.id,
+        requestedPixelId: explicitPixelId || (directPixelId ? String(directPixelId) : null),
         sessionId: sessionId || null,
         eventName: 'Purchase',
         eventTime: approvedAt || new Date(),
@@ -588,12 +596,14 @@ export async function dispatchNavigationToCapi(params: DispatchNavigationParams)
     const effectiveFbp = sessionData?.fbp || undefined
     const effectiveFbc = sessionData?.fbc || undefined
 
-    const recordFailedNavEvent = async (errorMsg: string, pixelDbId?: string | null) => {
+    const recordFailedNavEvent = async (errorMsg: string, pixelDbId?: string | null, targetRequestedPixelId?: string | null) => {
+      const effRequestedPixelId = targetRequestedPixelId !== undefined ? targetRequestedPixelId : (directPixelId ? String(directPixelId) : undefined)
       try {
         await prisma.trackingEvent.updateMany({
           where: { eventId, workspaceId },
           data: {
             pixelId: pixelDbId || undefined,
+            requestedPixelId: effRequestedPixelId || undefined,
             status: 'failed',
             capiError: errorMsg,
             clientIp: effectiveIp || null,
@@ -610,6 +620,7 @@ export async function dispatchNavigationToCapi(params: DispatchNavigationParams)
             where: { eventId, workspaceId },
             data: {
               status: 'failed',
+              requestedPixelId: effRequestedPixelId || undefined,
               capiError: `${errorMsg} (Falha ao vincular pixelId: ${err instanceof Error ? err.message : String(err)})`
             }
           }).catch(() => {})
@@ -646,7 +657,7 @@ export async function dispatchNavigationToCapi(params: DispatchNavigationParams)
           ? `Pixel ${directPixelId} is not active or lacks access token in workspace`
           : `Pixel ${directPixelId} is not found in workspace`
 
-        await recordFailedNavEvent(errorMsg, internalPixelDbId)
+        await recordFailedNavEvent(errorMsg, internalPixelDbId, directPixelId ? String(directPixelId) : null)
         return {
           sent: false,
           success: false,
@@ -736,6 +747,7 @@ export async function dispatchNavigationToCapi(params: DispatchNavigationParams)
       where: { eventId, workspaceId },
       data: {
         pixelId: pixel.id,
+        requestedPixelId: directPixelId ? String(directPixelId) : undefined,
         status: isSuccess ? 'sent' : 'failed',
         capiResponse: JSON.stringify(capiResult),
         capiError: isSuccess ? null : JSON.stringify(capiResult?.error || 'Nenhum evento aceito pela Meta'),
@@ -814,7 +826,7 @@ export async function retryFailedCapiEvents(workspaceId?: string, limit = 20) {
         continue
       }
 
-      let explicitPixelId: string | null = evt.pixelId || null
+      let explicitPixelId: string | null = evt.requestedPixelId || evt.pixelId || null
 
       // Se não tínhamos pixelId gravado no evento, tentar resolver vínculo explícito via produto da venda
       if (!explicitPixelId && evt.workspaceId && evt.orderId) {
@@ -870,7 +882,7 @@ export async function retryFailedCapiEvents(workspaceId?: string, limit = 20) {
       let pixel: any = null
 
       if (explicitPixelId) {
-        // Quando existe um vínculo explícito (no evento ou no produto da venda), o reenvio
+        // Quando existe um vínculo explícito (no evento via requestedPixelId/pixelId ou no produto da venda), o reenvio
         // DEVE usar exatamente esse pixel. Se ele estiver inativo ou sem access token,
         // o evento DEVE permanecer como failed e NUNCA fazer fallback para outro pixel ativo!
         pixel = await prisma.pixel.findFirst({
@@ -890,7 +902,7 @@ export async function retryFailedCapiEvents(workspaceId?: string, limit = 20) {
             where: { id: evt.id },
             data: {
               status: 'failed',
-              capiError: `O pixel explicitamente vinculado (${explicitPixelId}) está inativo, sem token de acesso ou foi desativado durante o retry`,
+              capiError: `O pixel explicitamente vinculado (${explicitPixelId}) está inativo, sem token de acesso ou não foi encontrado durante o retry`,
               updatedAt: new Date()
             }
           }).catch(() => {})

@@ -1654,6 +1654,7 @@ describe('Automação CAPI, Decoração Real de Checkout, Roteamento por Produto
       assert.ok(dbEvtA, 'Evento A deve ter sido gravado')
       assert.equal(dbEvtA.status, 'failed', 'Evento não deve ficar preso em sending')
       assert.equal(dbEvtA.pixelId, pixelInactive.id, 'O campo TrackingEvent.pixelId deve receber o ID interno (cuid), não o ID numérico da Meta')
+      assert.equal(dbEvtA.requestedPixelId, '555555555555555', 'O campo requestedPixelId deve persistir o ID solicitado')
       assert.ok(String(dbEvtA.capiError).includes('555555555555555'), 'A mensagem de erro deve preservar o identificador solicitado')
       assert.ok(String(dbEvtA.capiError).includes('inativo'), 'Mensagem deve indicar que o pixel está inativo')
 
@@ -1678,10 +1679,149 @@ describe('Automação CAPI, Decoração Real de Checkout, Roteamento por Produto
       assert.ok(dbEvtB, 'Evento B deve ter sido gravado')
       assert.equal(dbEvtB.status, 'failed', 'Evento de pixel inexistente deve ser gravado com status failed e JAMAIS ficar preso em sending')
       assert.equal(dbEvtB.pixelId, null, 'O campo TrackingEvent.pixelId deve permanecer null quando o pixel não existe no banco, evitando erro de chave estrangeira')
+      assert.equal(dbEvtB.requestedPixelId, '999999999999999', 'O campo requestedPixelId deve persistir o identificador solicitado mesmo sem FK')
       assert.ok(String(dbEvtB.capiError).includes('999999999999999'), 'A mensagem de erro deve preservar o identificador solicitado')
       assert.ok(String(dbEvtB.capiError).includes('não foi encontrado'), 'Mensagem deve indicar que o pixel não foi encontrado no workspace')
 
     } finally {
+      if (isoWsId) {
+        await prisma.trackingEvent.deleteMany({ where: { workspaceId: isoWsId } })
+        await prisma.pixel.deleteMany({ where: { workspaceId: isoWsId } })
+        await prisma.workspace.delete({ where: { id: isoWsId } }).catch(() => {})
+      }
+    }
+  })
+
+  // 26. Retry com requestedPixelId inexistente + somente Pixel B ativo no workspace: ZERO chamadas à Meta e NENHUM envio para Pixel B
+  it('26. Retry com requestedPixelId inexistente + somente Pixel B ativo no workspace: ZERO chamadas à Meta e NENHUM envio para Pixel B', async () => {
+    let metaCalls = 0
+    const calledUrls: string[] = []
+    const originalFetch = global.fetch
+    global.fetch = async (url: any) => {
+      metaCalls++
+      calledUrls.push(String(url))
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ events_received: 1 })
+      } as any
+    }
+
+    let isoWsId: string | null = null
+    const nonExistentPixelId = '999999999999999'
+    const orderPurchaseId = `RETRY_NONEXIST_PURCHASE_${Date.now()}`
+    const navEventId = `evt_nav_nonexist_${Date.now()}`
+
+    try {
+      // 1. Criar workspace isolado
+      const isoWs = await prisma.workspace.create({
+        data: {
+          name: 'Workspace Retry Nonexistent Pixel Test',
+          slug: `iso-retry-nonexist-${Date.now()}`
+        }
+      })
+      isoWsId = isoWs.id
+
+      // 2. Criar APENAS o Pixel B ativo no workspace
+      const pixelB = await prisma.pixel.create({
+        data: {
+          workspaceId: isoWs.id,
+          name: 'Pixel B Unico Ativo',
+          pixelId: '777777777777777',
+          accessTokenEnc: encrypt('EAABmocktokenB'),
+          status: 'active'
+        }
+      })
+
+      // 3. Criar evento de Purchase com status failed, pixelId null e requestedPixelId = Pixel A (inexistente)
+      const purchaseEventId = buildPurchaseEventId(isoWs.id, orderPurchaseId, 'kiwify')
+      await prisma.trackingEvent.create({
+        data: {
+          eventId: purchaseEventId,
+          workspaceId: isoWs.id,
+          pixelId: null,
+          requestedPixelId: nonExistentPixelId,
+          eventName: 'Purchase',
+          eventTime: new Date(),
+          orderId: orderPurchaseId,
+          platform: 'kiwify',
+          value: 197,
+          status: 'failed',
+          capiError: `O pixel explicitamente vinculado (${nonExistentPixelId}) não foi encontrado no workspace.`,
+          retryCount: 0,
+          emailHash: sha256Hash('retry_nonexist@teste.com')
+        }
+      })
+
+      // 4. Criar evento de Navegação (PageView) com status failed, pixelId null e requestedPixelId = Pixel A (inexistente)
+      await prisma.trackingEvent.create({
+        data: {
+          eventId: navEventId,
+          workspaceId: isoWs.id,
+          pixelId: null,
+          requestedPixelId: nonExistentPixelId,
+          eventName: 'PageView',
+          eventTime: new Date(),
+          sourceUrl: 'https://exemplo.com/landing-page',
+          status: 'failed',
+          capiError: `Pixel ${nonExistentPixelId} is not found in workspace`,
+          retryCount: 0
+        }
+      })
+
+      // 5. Executar o retry no workspace
+      await retryFailedCapiEvents(isoWs.id)
+
+      // 6. Verificar que ZERO chamadas foram feitas para a Meta (Pixel B JAMAIS deve receber esses eventos)
+      assert.equal(metaCalls, 0, 'ZERO chamadas devem ser feitas à Meta: o retry NÃO deve usar o Pixel B ativo como fallback quando há requestedPixelId')
+      assert.equal(calledUrls.length, 0, 'Nenhuma URL de Pixel deve ter sido acessada')
+
+      const dbPurchaseEvt = await prisma.trackingEvent.findUnique({
+        where: { eventId: purchaseEventId }
+      })
+      assert.equal(dbPurchaseEvt?.status, 'failed', 'Status da compra deve permanecer failed')
+      assert.ok(
+        String(dbPurchaseEvt?.capiError).includes(nonExistentPixelId),
+        'Erro do evento deve continuar referenciando o requestedPixelId não encontrado'
+      )
+
+      const dbNavEvt = await prisma.trackingEvent.findUnique({
+        where: { eventId: navEventId }
+      })
+      assert.equal(dbNavEvt?.status, 'failed', 'Status da navegação deve permanecer failed')
+      assert.ok(
+        String(dbNavEvt?.capiError).includes(nonExistentPixelId),
+        'Erro do evento de navegação deve continuar referenciando o requestedPixelId não encontrado'
+      )
+
+      // 7. Agora simular que o usuário posteriormente cadastra e ativa o Pixel A (999999999999999)
+      const pixelA = await prisma.pixel.create({
+        data: {
+          workspaceId: isoWs.id,
+          name: 'Pixel A Recem Criado',
+          pixelId: nonExistentPixelId,
+          accessTokenEnc: encrypt('EAABmocktokenA_New'),
+          status: 'active'
+        }
+      })
+
+      // 8. Reexecutar o retry: agora os eventos DEVEM ser enviados para o Pixel A recém-criado!
+      metaCalls = 0
+      calledUrls.length = 0
+
+      await retryFailedCapiEvents(isoWs.id)
+
+      assert.ok(metaCalls > 0, 'Com o Pixel A cadastrado e ativo, o retry deve realizar o disparo para a Meta')
+      assert.ok(calledUrls.every(url => url.includes(nonExistentPixelId)), 'O disparo deve ser direcionado exclusivamente ao Pixel A solicitado')
+
+      const dbPurchaseRecovered = await prisma.trackingEvent.findUnique({
+        where: { eventId: purchaseEventId }
+      })
+      assert.equal(dbPurchaseRecovered?.status, 'sent', 'Após ativação do Pixel A, o evento deve ser transmitido com status sent')
+      assert.equal(dbPurchaseRecovered?.pixelId, pixelA.id, 'O campo FK pixelId deve ser preenchido com o CUID interno do Pixel A recém-ativado')
+
+    } finally {
+      global.fetch = originalFetch
       if (isoWsId) {
         await prisma.trackingEvent.deleteMany({ where: { workspaceId: isoWsId } })
         await prisma.pixel.deleteMany({ where: { workspaceId: isoWsId } })

@@ -359,6 +359,7 @@ model TrackingEvent {
   id              String   @id @default(cuid())
   workspaceId     String
   pixelId         String?
+  requestedPixelId String? // Meta Pixel ID numérico ou ID solicitado originalmente sem FK
   sessionId       String?
   eventId         String   @unique // for deduplication
   eventName       String   // PageView, Purchase, InitiateCheckout, etc.

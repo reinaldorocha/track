@@ -96,6 +96,7 @@ export async function POST(req: Request) {
           eventId: finalEventId,
           workspaceId: workspace.id,
           pixelId: resolvedPixelDbId,
+          requestedPixelId: pixelId ? String(pixelId) : null,
           sessionId,
           eventName,
           value: numericValue,
@@ -118,6 +119,7 @@ export async function POST(req: Request) {
       await prisma.trackingEvent.update({
         where: { id: existing.id },
         data: {
+          requestedPixelId: pixelId ? String(pixelId) : (existing as any).requestedPixelId || null,
           sessionId: sessionId || existing.sessionId,
           platform: existing.platform || platform || undefined,
           clientIp: existing.clientIp || effectiveIp,
