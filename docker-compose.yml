@@ -6,7 +6,7 @@ services:
     container_name: utm-track-app
     restart: always
     ports:
-      - "127.0.0.1:3000:3000"
+      - "127.0.0.1:3008:3000"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     env_file:

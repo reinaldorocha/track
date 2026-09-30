@@ -141,23 +141,22 @@ echo -e "\n${YELLOW}>> 6. Status do container:${NC}"
 docker ps -f name=utm-track-app
 
 echo -e "\n${GREEN}==============================================================================${NC}"
-echo -e "${GREEN}       UTM-TRACK INSTALADO E EM EXECUÇÃO COM SUCESSO NO DOCKER!               ${NC}"
+echo -e "${GREEN}   UTM-TRACK INSTALADO E EM EXECUÇÃO NO DOCKER NA PORTA LOCAL 3008!          ${NC}"
 echo -e "${GREEN}==============================================================================${NC}"
 
 # Extrair domínio do .env.production para exibir a configuração Nginx
 DOMAIN=$(grep -E '^NEXT_PUBLIC_APP_URL=' .env.production | cut -d '=' -f2 | sed -e 's|https://||' -e 's|http://||' -e 's|"||g' -e 's|/.*||')
 DOMAIN=${DOMAIN:-"track.seudominio.com.br"}
 
-echo -e "\n${CYAN}>> Próximo passo: Configuração do Nginx e SSL na VPS:${NC}"
-echo -e "1. Crie o arquivo de site no Nginx: ${YELLOW}sudo nano /etc/nginx/sites-available/utm-track${NC}"
-echo -e "2. Cole a configuração abaixo:"
+echo -e "\n${CYAN}>> A aplicação está escutando na porta local 3008 (http://127.0.0.1:3008).${NC}"
+echo -e "${CYAN}>> Para sua configuração manual do Nginx, utilize o bloco de exemplo abaixo:${NC}"
 echo -e "------------------------------------------------------------------------------"
 cat <<EOF
 server {
     server_name ${DOMAIN};
 
     location / {
-        proxy_pass http://127.0.0.1:3000;
+        proxy_pass http://127.0.0.1:3008;
         proxy_http_version 1.1;
         proxy_set_header Upgrade \$http_upgrade;
         proxy_set_header Connection 'upgrade';
@@ -172,7 +171,7 @@ server {
     }
 
     location /tracker.js {
-        proxy_pass http://127.0.0.1:3000/tracker.js;
+        proxy_pass http://127.0.0.1:3008/tracker.js;
         proxy_set_header Host \$host;
         add_header Access-Control-Allow-Origin *;
         add_header Cache-Control "public, max-age=3600, stale-while-revalidate=86400";
@@ -180,7 +179,6 @@ server {
 }
 EOF
 echo -e "------------------------------------------------------------------------------"
-echo -e "3. Ative o site e emita o certificado SSL gratuito:"
-echo -e "   ${YELLOW}sudo ln -sf /etc/nginx/sites-available/utm-track /etc/nginx/sites-enabled/${NC}"
+echo -e "Após salvar sua configuração manual no Nginx, recarregue e emita o SSL:"
 echo -e "   ${YELLOW}sudo nginx -t && sudo systemctl reload nginx${NC}"
 echo -e "   ${YELLOW}sudo certbot --nginx -d ${DOMAIN}${NC}\n"
