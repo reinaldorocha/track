@@ -14,6 +14,7 @@
   })();
 
   var metaPixelTag = typeof document !== 'undefined' && document.querySelector ? document.querySelector('meta[name="utmtrack-pixel"], meta[name="meta-pixel-id"]') : null;
+  var platformTag = typeof document !== 'undefined' && document.querySelector ? document.querySelector('meta[name="utmtrack-platform"], meta[name="platform"], meta[name="gateway"]') : null;
   
   var config = {
     apiUrl: (script && script.getAttribute('data-api-url')) || '',
@@ -23,7 +24,11 @@
              (typeof window !== 'undefined' && (window.UTM_TRACK_PIXEL_ID || window.UTM_PIXEL_ID)) ||
              getParam('pixel_id') ||
              getParam('pixelId') ||
-             ''
+             '',
+    platform: (script && (script.getAttribute('data-platform') || script.getAttribute('data-gateway'))) ||
+              (platformTag && platformTag.getAttribute('content')) ||
+              (typeof window !== 'undefined' && (window.UTM_TRACK_PLATFORM || window.UTM_PLATFORM)) ||
+              ''
   };
   
   if (!config.apiUrl || !config.workspaceId) return;
@@ -339,19 +344,35 @@
   }, true);
   
   function detectPlatform(orderId) {
+    // 1. Configuração explícita via script data-platform, meta tag, ou window global
+    if (config.platform) return config.platform.toLowerCase().trim();
+
+    // 2. Parâmetro direto de URL
     var p = getParam('platform') || getParam('gateway') || getParam('origem') || getParam('provider');
     if (p) return p.toLowerCase().trim();
 
+    // 3. Atributo direto na tag script (caso atualizado dinamicamente)
     if (script && script.getAttribute) {
       var dp = script.getAttribute('data-platform') || script.getAttribute('data-gateway');
       if (dp) return dp.toLowerCase().trim();
     }
 
+    // 4. Elemento na página de obrigado (data-platform em elemento ou container)
+    if (typeof document !== 'undefined' && document.querySelector) {
+      var elem = document.querySelector('[data-platform], [data-gateway], [data-utm-platform]');
+      if (elem) {
+        var ep = elem.getAttribute('data-platform') || elem.getAttribute('data-gateway') || elem.getAttribute('data-utm-platform');
+        if (ep) return ep.toLowerCase().trim();
+      }
+    }
+
+    // 5. Fallback por sessionStorage ou cookie gravado no clique de checkout
     try {
       var storedPlat = (typeof sessionStorage !== 'undefined' && sessionStorage.getItem('_utmt_platform')) || getCookie('_utmt_plat');
       if (storedPlat) return storedPlat.toLowerCase().trim();
     } catch(e) {}
 
+    // 6. Referrer
     var ref = (typeof document !== 'undefined' && document.referrer ? document.referrer : '').toLowerCase();
     if (ref.indexOf('hotmart') !== -1) return 'hotmart';
     if (ref.indexOf('kiwify') !== -1) return 'kiwify';
@@ -362,6 +383,7 @@
     if (ref.indexOf('eduzz') !== -1) return 'eduzz';
     if (ref.indexOf('braip') !== -1) return 'braip';
 
+    // 7. Padrões conhecidos de formato de Order ID / Tokens
     if (getParam('hottok') || (orderId && String(orderId).toUpperCase().indexOf('HP') === 0)) return 'hotmart';
     if (getParam('kiwify') || (orderId && String(orderId).indexOf('kw_') === 0)) return 'kiwify';
     if (getParam('cakto') || (orderId && String(orderId).indexOf('ck_') === 0)) return 'cakto';
@@ -373,15 +395,11 @@
   }
 
   function buildPurchaseEventId(workspaceId, orderId, platform) {
-    var cleanOrder = String(orderId || '').trim();
-    var cleanWs = String(workspaceId || '').trim();
-    var cleanPlat = String(platform || '').toLowerCase().trim();
+    var cleanOrder = String(orderId || '').trim().replace(/[^a-zA-Z0-9_-]/g, '_');
+    var cleanWs = String(workspaceId || '').trim().replace(/[^a-zA-Z0-9_-]/g, '_');
+    var cleanPlat = platform ? String(platform).trim().toLowerCase().replace(/[^a-z0-9_-]/g, '_') : 'direct';
 
-    var parts = ['purchase'];
-    if (cleanWs) parts.push(cleanWs);
-    if (cleanPlat) parts.push(cleanPlat);
-    parts.push(cleanOrder);
-    return parts.join('_');
+    return 'purchase_' + (cleanWs || 'default') + '_' + cleanPlat + '_' + cleanOrder;
   }
 
   // 3. Detecção e Disparo Automático de Purchase em Páginas de Obrigado / Confirmação com deduplicação CAPI

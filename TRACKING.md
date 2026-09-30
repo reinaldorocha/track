@@ -15,7 +15,7 @@ A área de **UTMs & Tracking** (`/integrations/utm`) atua como a central de conf
 
 O `tracker.js` é um script vanilla JavaScript ultra-leve (< 3KB), autônomo, não dependente de bibliotecas externas e projetado para nunca travar a renderização da página (carregamento assíncrono via atributo `async`).
 
-### Instalação na Página de Vendas
+### Instalação na Página de Vendas (Landing Page)
 ```html
 <script 
   src="https://utm-track-navy.vercel.app/tracker.js" 
@@ -24,6 +24,20 @@ O `tracker.js` é um script vanilla JavaScript ultra-leve (< 3KB), autônomo, n�
   async
 ></script>
 ```
+
+### Instalação na Página de Obrigado (Thank You Page / Deduplicação CAPI)
+Para garantir 100% de paridade determinística e deduplicação no Meta Pixel com a Conversions API (CAPI), instale o script na página de confirmação/obrigado configurando `data-platform` e `data-pixel-id` explicitamente:
+```html
+<script 
+  src="https://utm-track-navy.vercel.app/tracker.js" 
+  data-api-url="https://utm-track-navy.vercel.app" 
+  data-workspace-id="ID_DO_SEU_WORKSPACE" 
+  data-pixel-id="ID_DO_META_PIXEL"
+  data-platform="kiwify" <!-- ou "hotmart", "cakto", "yampi", "getfy", "shopify" -->
+  async
+></script>
+```
+Dessa forma, o navegador gera deterministicamente o mesmo `event_id` (`purchase_<workspace>_<platform>_<orderId>`) que o servidor gera no processamento dos webhooks, eliminando duplicidade no Meta Events Manager.
 
 ---
 

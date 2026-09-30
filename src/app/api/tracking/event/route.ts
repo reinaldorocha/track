@@ -56,7 +56,7 @@ export async function POST(req: Request) {
       // Better yet, just insert the event if sessionId is missing from DB, as it might be delayed.
     }
 
-    // 1. Para Purchase, verificar se já existe evento gravado para este pedido neste workspace e plataforma
+    // 1. Para Purchase, verificar se já existe evento gravado para este pedido neste workspace e plataforma (sem correspondência parcial)
     let finalEventId = eventId
     if (eventName === 'Purchase' && orderId) {
       const canonicalId = buildPurchaseEventId(workspace.id, String(orderId), platform)
@@ -67,8 +67,7 @@ export async function POST(req: Request) {
           eventName: 'Purchase',
           OR: [
             { eventId: canonicalId },
-            ...(platform ? [{ platform }] : []),
-            { eventId: { contains: `_${platform ? platform.toLowerCase() : ''}_` } }
+            ...(platform ? [{ platform }] : [])
           ]
         },
         orderBy: { createdAt: 'desc' }

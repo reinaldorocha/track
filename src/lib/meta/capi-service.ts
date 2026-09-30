@@ -120,7 +120,7 @@ export async function dispatchPurchaseToCapi(params: DispatchPurchaseParams) {
     const canonicalId = buildPurchaseEventId(workspaceId, externalId || saleId, platform)
     let eventId = directEventId || canonicalId
 
-    // Buscar evento existente estritamente isolado por workspace, orderId e plataforma
+    // Buscar evento existente estritamente isolado por workspace, orderId e plataforma (sem correspondência parcial)
     const existingEvt = await prisma.trackingEvent.findFirst({
       where: {
         workspaceId,
@@ -128,8 +128,8 @@ export async function dispatchPurchaseToCapi(params: DispatchPurchaseParams) {
         eventName: 'Purchase',
         OR: [
           { eventId: canonicalId },
-          ...(platform ? [{ platform }] : []),
-          { eventId: { contains: `_${platform ? platform.toLowerCase() : ''}_` } }
+          ...(directEventId ? [{ eventId: directEventId }] : []),
+          ...(platform ? [{ platform }] : [])
         ]
       },
       orderBy: { createdAt: 'desc' }
@@ -675,13 +675,42 @@ export async function retryFailedCapiEvents(workspaceId?: string, limit = 20) {
     let succeeded = 0
 
     for (const evt of failedEvents) {
+      // 1. Aquisição Atômica da Trava de Concorrência
+      // Garante que dois workers simultâneos de retry ou um webhook concorrente não disparem o mesmo evento
+      const lockResult = await prisma.trackingEvent.updateMany({
+        where: {
+          id: evt.id,
+          OR: [
+            { status: 'failed' },
+            { status: 'sending', updatedAt: { lt: staleThreshold } }
+          ]
+        },
+        data: {
+          status: 'sending',
+          updatedAt: new Date()
+        }
+      })
+
+      if (lockResult.count === 0) {
+        // Trava não adquirida: outro worker ou webhook simultâneo assumiu ou finalizou o envio
+        continue
+      }
+
       let pixel = evt.pixel
-      // Se não havia pixel associado na falha anterior (ex: ambição de pixel), tentar resolver agora
+      // Se não havia pixel associado na falha anterior (ex: ausência ou ambiguidade prévia), tentar resolver agora
       if (!pixel && evt.workspaceId) {
         if (evt.orderId) {
+          const effectivePlatform = evt.platform || (
+            String(evt.orderId).toUpperCase().startsWith('HP') ? 'hotmart' :
+            String(evt.orderId).toLowerCase().startsWith('kw_') ? 'kiwify' :
+            String(evt.orderId).toLowerCase().startsWith('ck_') ? 'cakto' :
+            undefined
+          )
+
           const sale = await prisma.sale.findFirst({
             where: {
               workspaceId: evt.workspaceId,
+              ...(effectivePlatform ? { platform: effectivePlatform } : {}),
               OR: [{ id: evt.orderId }, { externalId: evt.orderId }]
             },
             include: { items: { include: { product: true } } }
@@ -704,12 +733,30 @@ export async function retryFailedCapiEvents(workspaceId?: string, limit = 20) {
         }
       }
 
-      if (!pixel || !pixel.accessTokenEnc) continue
+      if (!pixel || !pixel.accessTokenEnc) {
+        await prisma.trackingEvent.update({
+          where: { id: evt.id },
+          data: {
+            status: 'failed',
+            capiError: 'Pixel não encontrado ou sem access token durante retry',
+            updatedAt: new Date()
+          }
+        }).catch(() => {})
+        continue
+      }
 
       let accessToken: string
       try {
         accessToken = decrypt(pixel.accessTokenEnc)
       } catch {
+        await prisma.trackingEvent.update({
+          where: { id: evt.id },
+          data: {
+            status: 'failed',
+            capiError: 'Falha ao descriptografar token do pixel durante retry',
+            updatedAt: new Date()
+          }
+        }).catch(() => {})
         continue
       }
 
@@ -736,43 +783,58 @@ export async function retryFailedCapiEvents(workspaceId?: string, limit = 20) {
         }
       }
 
-      const capiResult = await sendPixelEvents(
-        pixel.pixelId,
-        accessToken,
-        [pixelEvent],
-        pixel.testEventCode || undefined
-      )
+      try {
+        const capiResult = await sendPixelEvents(
+          pixel.pixelId,
+          accessToken,
+          [pixelEvent],
+          pixel.testEventCode || undefined
+        )
 
-      const isSuccess = Boolean(
-        capiResult &&
-        capiResult.ok !== false &&
-        !capiResult.error &&
-        (typeof capiResult.events_received === 'number' ? capiResult.events_received > 0 : true)
-      )
+        const isSuccess = Boolean(
+          capiResult &&
+          capiResult.ok !== false &&
+          !capiResult.error &&
+          (typeof capiResult.events_received === 'number' ? capiResult.events_received > 0 : true)
+        )
 
-      if (isSuccess) {
-        succeeded++
+        if (isSuccess) {
+          succeeded++
+          await prisma.trackingEvent.update({
+            where: { id: evt.id },
+            data: {
+              pixelId: pixel.id,
+              status: 'sent',
+              sentAt: new Date(),
+              capiResponse: JSON.stringify(capiResult),
+              capiError: null,
+              updatedAt: new Date()
+            }
+          })
+        } else {
+          await prisma.trackingEvent.update({
+            where: { id: evt.id },
+            data: {
+              pixelId: pixel.id,
+              status: 'failed',
+              retryCount: { increment: 1 },
+              capiResponse: JSON.stringify(capiResult),
+              capiError: JSON.stringify(capiResult?.error || 'Retry falhou'),
+              updatedAt: new Date()
+            }
+          })
+        }
+      } catch (sendErr: any) {
         await prisma.trackingEvent.update({
           where: { id: evt.id },
           data: {
-            pixelId: pixel.id,
-            status: 'sent',
-            sentAt: new Date(),
-            capiResponse: JSON.stringify(capiResult),
-            capiError: null
-          }
-        })
-      } else {
-        await prisma.trackingEvent.update({
-          where: { id: evt.id },
-          data: {
-            pixelId: pixel.id,
+            pixelId: pixel?.id || undefined,
             status: 'failed',
             retryCount: { increment: 1 },
-            capiResponse: JSON.stringify(capiResult),
-            capiError: JSON.stringify(capiResult?.error || 'Retry falhou')
+            capiError: String(sendErr?.message || sendErr || 'Exceção ao disparar retry CAPI'),
+            updatedAt: new Date()
           }
-        })
+        }).catch(() => {})
       }
     }
 

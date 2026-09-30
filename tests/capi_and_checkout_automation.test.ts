@@ -963,4 +963,245 @@ describe('Automação CAPI, Decoração Real de Checkout, Roteamento por Produto
       })
     }
   })
+
+  // 20. Concorrência no Retry: dois workers simultâneos adquirem trava atomicamente sem duplicar chamadas à Meta
+  it('20. Concorrência no Retry: dois workers simultâneos não duplicam o envio à Meta', async () => {
+    let metaCalls = 0
+    const originalFetch = global.fetch
+    global.fetch = async () => {
+      metaCalls++
+      // Simula pequena latência de rede para forçar janela de concorrência
+      await new Promise(r => setTimeout(r, 40))
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ events_received: 1 })
+      } as any
+    }
+
+    const concurrentOrderId = `RETRY_CONC_${Date.now()}`
+    const concurrentEventId = buildPurchaseEventId(testWorkspaceId, concurrentOrderId, 'kiwify')
+
+    try {
+      await prisma.trackingEvent.create({
+        data: {
+          eventId: concurrentEventId,
+          workspaceId: testWorkspaceId,
+          pixelId: testPixelA.id,
+          eventName: 'Purchase',
+          eventTime: new Date(),
+          orderId: concurrentOrderId,
+          platform: 'kiwify',
+          value: 197,
+          status: 'failed',
+          retryCount: 0,
+          clientIp: '177.10.20.30',
+          clientUserAgent: 'Mozilla/5.0 Retry Concurrent Worker',
+          emailHash: sha256Hash('concorrencia@teste.com')
+        }
+      })
+
+      // Disparar duas instâncias de retry concorrentemente no mesmo workspace
+      const [res1, res2] = await Promise.all([
+        retryFailedCapiEvents(testWorkspaceId),
+        retryFailedCapiEvents(testWorkspaceId)
+      ])
+
+      // Exatamente 1 chamada à Meta deve ter sido feita
+      assert.equal(metaCalls, 1, 'Exatamente UMA chamada à Meta Graph API deve ser realizada, mesmo com workers de retry concorrentes')
+      
+      const totalSucceeded = res1.succeeded + res2.succeeded
+      assert.equal(totalSucceeded, 1, 'Apenas 1 dos workers concorrentes deve contabilizar sucesso no envio')
+
+      const finalEvt = await prisma.trackingEvent.findUnique({
+        where: { eventId: concurrentEventId }
+      })
+      assert.equal(finalEvt?.status, 'sent', 'O evento deve terminar com status sent')
+    } finally {
+      global.fetch = originalFetch
+      await prisma.trackingEvent.deleteMany({
+        where: { eventId: concurrentEventId }
+      })
+    }
+  })
+
+  // 21. Recuperação no Retry de Pedidos com Mesmo ID em Plataformas Diferentes e Rejeição de Falso-Positivo por Substring
+  it('21. Recuperação no Retry: pedidos com mesmo ID em plataformas diferentes recuperam seus respectivos pixels sem contaminação cruzada', async () => {
+    const pixelsSent: string[] = []
+    const originalFetch = global.fetch
+    global.fetch = async (url: any) => {
+      const urlStr = String(url)
+      if (urlStr.includes(testPixelA.pixelId)) {
+        pixelsSent.push('PixelA_Kiwify')
+      } else if (urlStr.includes(testPixelB.pixelId)) {
+        pixelsSent.push('PixelB_Hotmart')
+      }
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ events_received: 1 })
+      } as any
+    }
+
+    const sharedOrderId = `SHARED_ORDER_${Date.now()}`
+    const kiwifyEventId = buildPurchaseEventId(testWorkspaceId, sharedOrderId, 'kiwify')
+    const hotmartEventId = buildPurchaseEventId(testWorkspaceId, sharedOrderId, 'hotmart')
+
+    let saleKiwifyId: string | null = null
+    let saleHotmartId: string | null = null
+
+    try {
+      // 1. Criar Venda Kiwify associada ao Produto A (Pixel A)
+      const saleKiwify = await prisma.sale.create({
+        data: {
+          workspaceId: testWorkspaceId,
+          externalId: sharedOrderId,
+          platform: 'kiwify',
+          status: 'approved',
+          grossAmount: 150,
+          netAmount: 135,
+          orderedAt: new Date(),
+          approvedAt: new Date(),
+          items: {
+            create: [{
+              name: 'Produto A',
+              productId: testProductA.id,
+              quantity: 1,
+              unitPrice: 150,
+              totalPrice: 150
+            }]
+          }
+        }
+      })
+      saleKiwifyId = saleKiwify.id
+
+      // 2. Criar Venda Hotmart com o MESMO ID associada ao Produto B (Pixel B)
+      const saleHotmart = await prisma.sale.create({
+        data: {
+          workspaceId: testWorkspaceId,
+          externalId: sharedOrderId,
+          platform: 'hotmart',
+          status: 'approved',
+          grossAmount: 250,
+          netAmount: 225,
+          orderedAt: new Date(),
+          approvedAt: new Date(),
+          items: {
+            create: [{
+              name: 'Produto B',
+              productId: testProductB.id,
+              quantity: 1,
+              unitPrice: 250,
+              totalPrice: 250
+            }]
+          }
+        }
+      })
+      saleHotmartId = saleHotmart.id
+
+      // 3. Criar dois eventos falhos SEM pixel associado (pixelId = null)
+      // Simulando falha inicial onde o pixel precisa ser resolvido durante o retry
+      await prisma.trackingEvent.create({
+        data: {
+          eventId: kiwifyEventId,
+          workspaceId: testWorkspaceId,
+          pixelId: null, // sem pixel gravado inicialmente
+          eventName: 'Purchase',
+          eventTime: new Date(),
+          orderId: sharedOrderId,
+          platform: 'kiwify',
+          value: 150,
+          status: 'failed',
+          retryCount: 0,
+          clientIp: '187.1.2.3',
+          emailHash: sha256Hash('kiwify@teste.com')
+        }
+      })
+
+      await prisma.trackingEvent.create({
+        data: {
+          eventId: hotmartEventId,
+          workspaceId: testWorkspaceId,
+          pixelId: null, // sem pixel gravado inicialmente
+          eventName: 'Purchase',
+          eventTime: new Date(),
+          orderId: sharedOrderId,
+          platform: 'hotmart',
+          value: 250,
+          status: 'failed',
+          retryCount: 0,
+          clientIp: '187.4.5.6',
+          emailHash: sha256Hash('hotmart@teste.com')
+        }
+      })
+
+      // 4. Executar fila de retry
+      const retryResult = await retryFailedCapiEvents(testWorkspaceId)
+      assert.ok(retryResult.retried >= 2, 'Ambos os eventos devem ser processados')
+      assert.ok(retryResult.succeeded >= 2, 'Ambos os eventos devem ter sucesso')
+
+      // 5. Verificar que cada evento foi enviado estritamente ao seu respectivo pixel
+      const dbKiwifyEvt = await prisma.trackingEvent.findUnique({ where: { eventId: kiwifyEventId } })
+      const dbHotmartEvt = await prisma.trackingEvent.findUnique({ where: { eventId: hotmartEventId } })
+
+      assert.equal(dbKiwifyEvt?.pixelId, testPixelA.id, 'O evento Kiwify deve ter sido atribuído estritamente ao Pixel A')
+      assert.equal(dbHotmartEvt?.pixelId, testPixelB.id, 'O evento Hotmart deve ter sido atribuído estritamente ao Pixel B')
+      assert.equal(dbKiwifyEvt?.status, 'sent', 'Evento Kiwify deve ter status sent')
+      assert.equal(dbHotmartEvt?.status, 'sent', 'Evento Hotmart deve ter status sent')
+
+      assert.ok(pixelsSent.includes('PixelA_Kiwify'), 'Meta Graph API deve ter recebido evento no Pixel A para Kiwify')
+      assert.ok(pixelsSent.includes('PixelB_Hotmart'), 'Meta Graph API deve ter recebido evento no Pixel B para Hotmart')
+
+      // 6. Testar rejeição de substring: criar pedido Hotmart cujo ID contenha a palavra 'kiwify'
+      // e assegurar que dispatchPurchaseToCapi para Kiwify NÃO herde o evento Hotmart
+      const substringOrderId = `ORDER_kiwify_in_hotmart_${Date.now()}`
+      const hotmartSubId = buildPurchaseEventId(testWorkspaceId, substringOrderId, 'hotmart')
+      await prisma.trackingEvent.create({
+        data: {
+          eventId: hotmartSubId,
+          workspaceId: testWorkspaceId,
+          pixelId: testPixelB.id,
+          eventName: 'Purchase',
+          eventTime: new Date(),
+          orderId: substringOrderId,
+          platform: 'hotmart',
+          value: 300,
+          status: 'sent',
+          sentAt: new Date()
+        }
+      })
+
+      // Tentar enviar Kiwify para esse mesmo orderId: NÃO deve considerar already_sent do Hotmart!
+      const kiwifySubResult = await dispatchPurchaseToCapi({
+        workspaceId: testWorkspaceId,
+        saleId: `sale_${substringOrderId}`,
+        externalId: substringOrderId,
+        platform: 'kiwify',
+        productId: testProductA.id,
+        grossAmount: 120,
+        currency: 'BRL',
+        customerEmail: 'teste@kiwify.com'
+      })
+
+      assert.notEqual(kiwifySubResult.reason, 'already_sent', 'Kiwify NÃO pode ser confundido com Hotmart mesmo que o orderId contenha o nome do gateway')
+      assert.equal(kiwifySubResult.sent, true, 'O evento Kiwify deve ser enviado de forma independente à Meta')
+
+      await prisma.trackingEvent.deleteMany({
+        where: { eventId: { in: [hotmartSubId, buildPurchaseEventId(testWorkspaceId, substringOrderId, 'kiwify')] } }
+      })
+    } finally {
+      global.fetch = originalFetch
+      await prisma.trackingEvent.deleteMany({
+        where: { eventId: { in: [kiwifyEventId, hotmartEventId] } }
+      })
+      if (saleKiwifyId) {
+        await prisma.saleItem.deleteMany({ where: { saleId: saleKiwifyId } })
+        await prisma.sale.delete({ where: { id: saleKiwifyId } }).catch(() => {})
+      }
+      if (saleHotmartId) {
+        await prisma.saleItem.deleteMany({ where: { saleId: saleHotmartId } })
+        await prisma.sale.delete({ where: { id: saleHotmartId } }).catch(() => {})
+      }
+    }
+  })
 })
