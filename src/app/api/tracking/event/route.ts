@@ -55,9 +55,25 @@ export async function POST(req: Request) {
       // Better yet, just insert the event if sessionId is missing from DB, as it might be delayed.
     }
 
+    // 1. Para Purchase, verificar se já existe evento gravado para este pedido neste workspace
+    let finalEventId = eventId
+    if (eventName === 'Purchase' && orderId) {
+      const existingPurchase = await prisma.trackingEvent.findFirst({
+        where: {
+          workspaceId: workspace.id,
+          orderId: String(orderId),
+          eventName: 'Purchase'
+        },
+        orderBy: { createdAt: 'desc' }
+      })
+      if (existingPurchase?.eventId) {
+        finalEventId = existingPurchase.eventId
+      }
+    }
+
     // Upsert or create event (check idempotency)
     const existing = await prisma.trackingEvent.findUnique({
-      where: { eventId }
+      where: { eventId: finalEventId }
     })
 
     const clientIp = req.headers.get('x-forwarded-for')?.split(',')[0]?.trim() || req.headers.get('x-real-ip') || undefined
@@ -69,7 +85,7 @@ export async function POST(req: Request) {
     if (!existing) {
       await prisma.trackingEvent.create({
         data: {
-          eventId,
+          eventId: finalEventId,
           workspaceId: workspace.id,
           pixelId: resolvedPixelDbId,
           sessionId,
@@ -88,32 +104,45 @@ export async function POST(req: Request) {
           fbclid: session?.fbclid || null
         }
       })
-
-      // Disparo para Meta CAPI (PageView, InitiateCheckout, Lead, etc.)
-      // NOTA: Eventos 'Purchase' do navegador NÃO são reenviados aqui via CAPI
-      // para evitar duplicidade de compra com o webhook do gateway que já dispara o CAPI oficial.
-      if (eventName !== 'Purchase') {
-        try {
-          await dispatchNavigationToCapi({
-            workspaceId: workspace.id,
-            sessionId,
-            eventName,
-            eventId,
-            sourceUrl,
-            value: numericValue !== null ? numericValue : undefined,
-            currency,
-            contentIds: contentIds ? (typeof contentIds === 'string' ? contentIds : JSON.stringify(contentIds)) : undefined,
-            clientIp: effectiveIp || undefined,
-            clientUserAgent: effectiveUserAgent || undefined,
-            pixelId
-          })
-        } catch (err: unknown) {
-          console.error('[Tracking Event] CAPI dispatch error:', err)
+    } else {
+      // Enriquecer dados de matching no evento existente se vieram do navegador
+      await prisma.trackingEvent.update({
+        where: { id: existing.id },
+        data: {
+          sessionId: sessionId || existing.sessionId,
+          clientIp: existing.clientIp || effectiveIp,
+          clientUserAgent: existing.clientUserAgent || effectiveUserAgent,
+          fbp: existing.fbp || session?.fbp || null,
+          fbc: existing.fbc || session?.fbc || null,
+          fbclid: existing.fbclid || session?.fbclid || null
         }
+      }).catch(() => {})
+    }
+
+    // Disparo para Meta CAPI (PageView, InitiateCheckout, Lead, etc.)
+    // NOTA: Eventos 'Purchase' do navegador NÃO são reenviados aqui via CAPI
+    // para evitar duplicidade de compra com o webhook do gateway que já dispara o CAPI oficial.
+    if (eventName !== 'Purchase') {
+      try {
+        await dispatchNavigationToCapi({
+          workspaceId: workspace.id,
+          sessionId,
+          eventName,
+          eventId,
+          sourceUrl,
+          value: numericValue !== null ? numericValue : undefined,
+          currency,
+          contentIds: contentIds ? (typeof contentIds === 'string' ? contentIds : JSON.stringify(contentIds)) : undefined,
+          clientIp: effectiveIp || undefined,
+          clientUserAgent: effectiveUserAgent || undefined,
+          pixelId
+        })
+      } catch (err: unknown) {
+        console.error('[Tracking Event] CAPI dispatch error:', err)
       }
     }
 
-    return NextResponse.json({ success: true, eventId })
+    return NextResponse.json({ success: true, eventId: finalEventId })
   } catch (error) {
     console.error('Event tracking error:', error)
     return NextResponse.json({ success: false, error: 'Event tracking failed' }, { status: 500 })

@@ -385,6 +385,7 @@ model TrackingEvent {
   retryCount      Int      @default(0)
   sentAt          DateTime?
   createdAt       DateTime @default(now())
+  updatedAt       DateTime @default(now()) @updatedAt
 
   workspace Workspace       @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
   pixel     Pixel?          @relation(fields: [pixelId], references: [id])

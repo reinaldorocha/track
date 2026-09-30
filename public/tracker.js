@@ -314,6 +314,44 @@
     }
   }, true);
   
+  function detectPlatform(orderId) {
+    var p = getParam('platform') || getParam('gateway') || getParam('origem') || getParam('provider');
+    if (p) return p.toLowerCase().trim();
+
+    if (currentScript) {
+      var dp = currentScript.getAttribute('data-platform') || currentScript.getAttribute('data-gateway');
+      if (dp) return dp.toLowerCase().trim();
+    }
+
+    var ref = (document.referrer || '').toLowerCase();
+    if (ref.indexOf('hotmart') !== -1) return 'hotmart';
+    if (ref.indexOf('kiwify') !== -1) return 'kiwify';
+    if (ref.indexOf('cakto') !== -1 || ref.indexOf('cacto') !== -1) return 'cakto';
+    if (ref.indexOf('yampi') !== -1) return 'yampi';
+    if (ref.indexOf('getfy') !== -1) return 'getfy';
+    if (ref.indexOf('shopify') !== -1 || ref.indexOf('myshopify') !== -1) return 'shopify';
+    if (ref.indexOf('eduzz') !== -1) return 'eduzz';
+    if (ref.indexOf('braip') !== -1) return 'braip';
+
+    if (getParam('hottok') || (orderId && String(orderId).toUpperCase().indexOf('HP') === 0)) return 'hotmart';
+    if (getParam('kiwify') || (orderId && String(orderId).indexOf('kw_') === 0)) return 'kiwify';
+    if (getParam('cakto') || (orderId && String(orderId).indexOf('ck_') === 0)) return 'cakto';
+
+    return '';
+  }
+
+  function buildPurchaseEventId(workspaceId, orderId, platform) {
+    var cleanOrder = String(orderId || '').trim();
+    var cleanWs = String(workspaceId || '').trim();
+    var cleanPlat = String(platform || '').toLowerCase().trim();
+
+    var parts = ['purchase'];
+    if (cleanWs) parts.push(cleanWs);
+    if (cleanPlat) parts.push(cleanPlat);
+    parts.push(cleanOrder);
+    return parts.join('_');
+  }
+
   // 3. Detecção e Disparo Automático de Purchase em Páginas de Obrigado / Confirmação com deduplicação CAPI
   (function detectThankYouPage() {
     var path = location.pathname.toLowerCase();
@@ -331,7 +369,8 @@
           sessionStorage.setItem(storageKey, 'true');
           var val = parseFloat(getParam('value') || getParam('amount') || '0');
           var curr = getParam('currency') || 'BRL';
-          var purchaseEventId = 'purchase_' + orderId;
+          var platform = detectPlatform(orderId);
+          var purchaseEventId = buildPurchaseEventId(config.workspaceId, orderId, platform);
 
           fireBrowserPixel('Purchase', {
             value: val,
@@ -376,7 +415,8 @@
     trackPurchase: function(data) {
       data = data || {};
       var orderId = data.orderId || data.order_id || data.transaction || getParam('order_id') || getParam('transaction') || getParam('order');
-      var purchaseEventId = orderId ? ('purchase_' + orderId) : genEventId();
+      var platform = data.platform || detectPlatform(orderId);
+      var purchaseEventId = orderId ? buildPurchaseEventId(config.workspaceId, orderId, platform) : genEventId();
       var val = Number(data.value || data.amount || getParam('value') || 0);
       var curr = data.currency || getParam('currency') || 'BRL';
       var targetPixel = data.pixelId || config.pixelId || undefined;
@@ -401,6 +441,8 @@
       });
       return purchaseEventId;
     },
+    buildPurchaseEventId: buildPurchaseEventId,
+    detectPlatform: detectPlatform,
     decorateUrl: decorateUrl,
     sessionId: sessionId,
     visitorId: visitorId,

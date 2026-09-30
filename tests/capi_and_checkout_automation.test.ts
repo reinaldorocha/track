@@ -10,7 +10,7 @@ import {
   normalizeSaleStatus,
   normalizeSaleUtms
 } from '../src/lib/integrations/normalizer'
-import { dispatchPurchaseToCapi, dispatchNavigationToCapi, retryFailedCapiEvents } from '../src/lib/meta/capi-service'
+import { dispatchPurchaseToCapi, dispatchNavigationToCapi, retryFailedCapiEvents, buildPurchaseEventId } from '../src/lib/meta/capi-service'
 import { sendPixelEvents } from '../src/lib/meta/pixel'
 import { decorateCheckoutUrl, isCheckoutUrl } from '../src/lib/tracking/checkout-decorator'
 import { prisma } from '../src/lib/db'
@@ -198,7 +198,7 @@ describe('Automação CAPI, Decoração Real de Checkout, Roteamento por Produto
 
       // Verificar registro no banco com status failed
       const dbEvent = await prisma.trackingEvent.findUnique({
-        where: { eventId: 'purchase_ext_order_err_1' }
+        where: { eventId: res.eventId }
       })
       assert.ok(dbEvent)
       assert.equal(dbEvent.status, 'failed')
@@ -209,14 +209,16 @@ describe('Automação CAPI, Decoração Real de Checkout, Roteamento por Produto
   })
 
   // 4. Deduplicação Paritária: ID gerado no Navegador bate exatamente com o ID do CAPI Server
-  it('4. Deduplicação Paritária: event_id do navegador bate com o event_id do webhook/CAPI', () => {
+  it('4. Deduplicação Paritária: event_id do navegador bate com o event_id do webhook/CAPI com escopo de workspace e plataforma', () => {
     const orderId = 'HP123456789'
+    const platform = 'hotmart'
     // Formato gerado pelo tracker.js na thank you page
-    const browserEventId = `purchase_${orderId}`
+    const browserEventId = buildPurchaseEventId(testWorkspaceId, orderId, platform)
     // Formato gerado pelo CAPI no backend
-    const serverEventId = `purchase_${orderId}`
+    const serverEventId = buildPurchaseEventId(testWorkspaceId, orderId, platform)
 
     assert.equal(browserEventId, serverEventId, 'event_id entre Pixel do Browser e CAPI Server é 100% idêntico')
+    assert.equal(browserEventId, `purchase_${testWorkspaceId}_hotmart_${orderId}`)
   })
 
   // 5. Fila e Reprocessamento de Eventos com Falha (Retry Queue)
@@ -385,7 +387,7 @@ describe('Automação CAPI, Decoração Real de Checkout, Roteamento por Produto
       const fbc = 'fb.1.1700000000.IwAR_test_click'
 
       // 1º Envio falha
-      await dispatchPurchaseToCapi({
+      const firstRes = await dispatchPurchaseToCapi({
         workspaceId: testWorkspaceId,
         saleId: 'sale_retry_emq_1',
         externalId: 'ext_retry_emq_1',
@@ -399,7 +401,7 @@ describe('Automação CAPI, Decoração Real de Checkout, Roteamento por Produto
 
       // Verificar que o TrackingEvent gravou os hashes e identificadores
       const failedEvt = await prisma.trackingEvent.findUnique({
-        where: { eventId: 'purchase_ext_retry_emq_1' }
+        where: { eventId: firstRes.eventId }
       })
       assert.ok(failedEvt)
       assert.equal(failedEvt.status, 'failed')
@@ -490,7 +492,7 @@ describe('Automação CAPI, Decoração Real de Checkout, Roteamento por Produto
       assert.equal(result.reason, 'pixel_not_configured')
 
       const savedEvt = await prisma.trackingEvent.findUnique({
-        where: { eventId: 'purchase_ext_empty_px_1' }
+        where: { eventId: result.eventId }
       })
       assert.ok(savedEvt, 'TrackingEvent deve ser persistido mesmo sem pixel')
       assert.equal(savedEvt.status, 'failed')
@@ -578,6 +580,112 @@ describe('Automação CAPI, Decoração Real de Checkout, Roteamento por Produto
     } finally {
       global.fetch = originalFetch
       await prisma.trackingEvent.deleteMany({ where: { eventId: retryEventId } })
+    }
+  })
+
+  // 14. Idempotência estrita: reenvio de venda já aprovada e enviada é detectado e ignorado antes de chamar a Meta
+  it('14. Idempotência estrita: reenvio de venda já aprovada e enviada é ignorado antes da Meta', async () => {
+    let metaFetchCallCount = 0
+    const originalFetch = global.fetch
+    global.fetch = async () => {
+      metaFetchCallCount++
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ events_received: 1 })
+      } as any
+    }
+
+    try {
+      const orderId = `idemp_order_${Date.now()}`
+      // 1ª Chamada: Envia com sucesso
+      const res1 = await dispatchPurchaseToCapi({
+        workspaceId: testWorkspaceId,
+        saleId: `sale_${orderId}`,
+        externalId: orderId,
+        grossAmount: 497,
+        productId: testProductA.id,
+        customerEmail: 'idempotencia@teste.com'
+      })
+
+      assert.equal(res1.sent, true)
+      assert.equal(res1.success, true)
+      assert.equal(metaFetchCallCount, 1)
+
+      // 2ª Chamada: Mesma venda aprovada reenviada pelo gateway
+      const res2 = await dispatchPurchaseToCapi({
+        workspaceId: testWorkspaceId,
+        saleId: `sale_${orderId}`,
+        externalId: orderId,
+        grossAmount: 497,
+        productId: testProductA.id,
+        customerEmail: 'idempotencia@teste.com'
+      })
+
+      assert.equal(res2.sent, false)
+      assert.equal(res2.skipped, true)
+      assert.equal(res2.reason, 'already_sent')
+      assert.equal(metaFetchCallCount, 1, 'Meta Graph API NÃO pode ser chamada novamente para venda já enviada!')
+    } finally {
+      global.fetch = originalFetch
+    }
+  })
+
+  // 15. Isolamento de IDs: gateways diferentes e workspaces diferentes com mesmo ID de pedido não colidem
+  it('15. Isolamento de IDs: múltiplos gateways e workspaces com mesmo orderId coexistem sem colisão', async () => {
+    const ws2 = await prisma.workspace.create({
+      data: { name: 'Workspace Segundo', slug: `ws-sec-${Date.now()}` }
+    })
+
+    const sharedOrderId = 'ORDER_1001'
+    const eventIdWs1Hotmart = buildPurchaseEventId(testWorkspaceId, sharedOrderId, 'hotmart')
+    const eventIdWs1Kiwify = buildPurchaseEventId(testWorkspaceId, sharedOrderId, 'kiwify')
+    const eventIdWs2Hotmart = buildPurchaseEventId(ws2.id, sharedOrderId, 'hotmart')
+
+    assert.notEqual(eventIdWs1Hotmart, eventIdWs1Kiwify, 'Plataformas diferentes no mesmo workspace geram eventIds distintos')
+    assert.notEqual(eventIdWs1Hotmart, eventIdWs2Hotmart, 'Mesmo orderId em workspaces diferentes gera eventIds distintos')
+
+    try {
+      // Criar os 3 eventos simultaneamente no banco
+      const e1 = await prisma.trackingEvent.create({
+        data: {
+          eventId: eventIdWs1Hotmart,
+          workspaceId: testWorkspaceId,
+          eventName: 'Purchase',
+          eventTime: new Date(),
+          orderId: sharedOrderId,
+          status: 'sent'
+        }
+      })
+
+      const e2 = await prisma.trackingEvent.create({
+        data: {
+          eventId: eventIdWs1Kiwify,
+          workspaceId: testWorkspaceId,
+          eventName: 'Purchase',
+          eventTime: new Date(),
+          orderId: sharedOrderId,
+          status: 'sent'
+        }
+      })
+
+      const e3 = await prisma.trackingEvent.create({
+        data: {
+          eventId: eventIdWs2Hotmart,
+          workspaceId: ws2.id,
+          eventName: 'Purchase',
+          eventTime: new Date(),
+          orderId: sharedOrderId,
+          status: 'sent'
+        }
+      })
+
+      assert.ok(e1 && e2 && e3, 'Todos os 3 eventos coexistem no banco sem violar restrição unique')
+    } finally {
+      await prisma.trackingEvent.deleteMany({
+        where: { eventId: { in: [eventIdWs1Hotmart, eventIdWs1Kiwify, eventIdWs2Hotmart] } }
+      })
+      await prisma.workspace.delete({ where: { id: ws2.id } })
     }
   })
 })

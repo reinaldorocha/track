@@ -18,6 +18,24 @@ export interface DispatchPurchaseParams {
   pixelId?: string
   clientIp?: string
   clientUserAgent?: string
+  platform?: string
+  eventId?: string
+}
+
+/**
+ * Constrói identificador canônico e globalmente único para eventos de Purchase
+ * com escopo por Workspace e Plataforma, garantindo paridade e deduplicação estrita com o tracker.js.
+ */
+export function buildPurchaseEventId(workspaceId: string, orderId: string, platform?: string): string {
+  const cleanOrder = String(orderId || '').trim()
+  const cleanWs = String(workspaceId || '').trim()
+  const cleanPlat = String(platform || '').toLowerCase().trim()
+
+  const parts = ['purchase']
+  if (cleanWs) parts.push(cleanWs)
+  if (cleanPlat) parts.push(cleanPlat)
+  parts.push(cleanOrder)
+  return parts.join('_')
 }
 
 export interface DispatchNavigationParams {
@@ -39,6 +57,7 @@ export interface DispatchNavigationParams {
  * com roteamento por produto -> pixel, hash SHA-256 e deduplicação via event_id.
  */
 export async function dispatchPurchaseToCapi(params: DispatchPurchaseParams) {
+  let resolvedEventId: string | undefined = undefined
   try {
     const {
       workspaceId,
@@ -55,10 +74,64 @@ export async function dispatchPurchaseToCapi(params: DispatchPurchaseParams) {
       productId,
       pixelId: directPixelId,
       clientIp,
-      clientUserAgent
+      clientUserAgent,
+      platform,
+      eventId: directEventId
     } = params
 
     if (!workspaceId) return { sent: false, success: false, reason: 'missing_workspace_id' }
+
+    // 0. Resolver ou herdar eventId canônico e globalmente único
+    let eventId = directEventId
+    if (!eventId) {
+      // 0.1 Se o tracker.js já disparou o evento no navegador para esta venda/pedido, reutilizar o mesmo eventId
+      const existingEvt = await prisma.trackingEvent.findFirst({
+        where: {
+          workspaceId,
+          orderId: externalId || saleId,
+          eventName: 'Purchase'
+        },
+        orderBy: { createdAt: 'desc' }
+      })
+      if (existingEvt?.eventId) {
+        eventId = existingEvt.eventId
+      } else {
+        eventId = buildPurchaseEventId(workspaceId, externalId || saleId, platform)
+      }
+    }
+    resolvedEventId = eventId
+
+    // 0.2 Idempotência Estrita: Se já foi enviado com sucesso para a Meta CAPI anteriormente, NUNCA reenviar
+    const existingStatus = await prisma.trackingEvent.findUnique({
+      where: { eventId }
+    })
+
+    if (existingStatus?.status === 'sent') {
+      console.log(`[CAPI Service] Idempotência: Purchase ${eventId} já foi transmitido anteriormente para a Meta com sucesso em ${existingStatus.sentAt}. Reenvio duplicado ignorado.`)
+      return {
+        sent: false,
+        success: true,
+        skipped: true,
+        reason: 'already_sent',
+        eventId,
+        pixelId: existingStatus.pixelId || undefined
+      }
+    }
+
+    // 0.3 Trava de Concorrência: se a compra já está 'sending' há menos de 30s, evitar disparo duplo simultâneo
+    if (existingStatus?.status === 'sending' && existingStatus.updatedAt) {
+      const ageSeconds = (Date.now() - new Date(existingStatus.updatedAt).getTime()) / 1000
+      if (ageSeconds < 30) {
+        console.log(`[CAPI Service] Idempotência: Purchase ${eventId} já está sendo transmitido em outra requisição simultânea. Disparo concorrente ignorado.`)
+        return {
+          sent: false,
+          success: true,
+          skipped: true,
+          reason: 'in_flight',
+          eventId
+        }
+      }
+    }
 
     // 0. Pré-computar sessionData, userData e dados de matching para que QUALQUER falha preserve 100% dos dados
     let sessionData: { fbclid?: string | null; fbp?: string | null; fbc?: string | null; userAgent?: string | null; ipAddress?: string | null } | null = null
@@ -93,8 +166,34 @@ export async function dispatchPurchaseToCapi(params: DispatchPurchaseParams) {
       }
     }
 
-    const eventId = `purchase_${externalId || saleId}`
     const eventValue = (grossAmount !== null && grossAmount !== undefined) ? Number(grossAmount) : 0
+
+    // 0.4 Registrar que o evento está em processamento ('sending') antes de chamar a Meta (lock de concorrência)
+    await prisma.trackingEvent.upsert({
+      where: { eventId },
+      update: {
+        status: 'sending'
+      },
+      create: {
+        eventId,
+        workspaceId,
+        sessionId: sessionId || null,
+        eventName: 'Purchase',
+        eventTime: approvedAt || new Date(),
+        value: eventValue,
+        currency: currency || 'BRL',
+        orderId: externalId || saleId,
+        status: 'sending',
+        retryCount: 0,
+        clientIp: effectiveIp || null,
+        clientUserAgent: effectiveUserAgent || null,
+        emailHash: userData.em?.[0] || null,
+        phoneHash: userData.ph?.[0] || null,
+        fbp: effectiveFbp || null,
+        fbc: effectiveFbc || null,
+        fbclid: sessionData?.fbclid || null
+      }
+    }).catch(err => console.error('[CAPI Service] Erro ao registrar status sending:', err))
 
     const recordFailedPurchaseEvent = async (errorMsg: string, pixelDbId?: string | null) => {
       await prisma.trackingEvent.upsert({
@@ -147,7 +246,7 @@ export async function dispatchPurchaseToCapi(params: DispatchPurchaseParams) {
     if (activePixels.length === 0) {
       const errorMsg = 'No active pixel configured with access token in workspace'
       await recordFailedPurchaseEvent(errorMsg)
-      return { sent: false, success: false, reason: 'pixel_not_configured', error: errorMsg }
+      return { sent: false, success: false, reason: 'pixel_not_configured', error: errorMsg, eventId }
     }
 
     let pixel: typeof activePixels[0] | null = null
@@ -201,7 +300,8 @@ export async function dispatchPurchaseToCapi(params: DispatchPurchaseParams) {
           sent: false,
           success: false,
           reason: 'ambiguous_pixel_configuration',
-          error: errorMsg
+          error: errorMsg,
+          eventId
         }
       }
     }
@@ -209,7 +309,7 @@ export async function dispatchPurchaseToCapi(params: DispatchPurchaseParams) {
     if (!pixel || !pixel.accessTokenEnc) {
       const errorMsg = 'Selected pixel does not have an access token'
       await recordFailedPurchaseEvent(errorMsg, pixel?.id)
-      return { sent: false, success: false, reason: 'pixel_not_configured', error: errorMsg }
+      return { sent: false, success: false, reason: 'pixel_not_configured', error: errorMsg, eventId }
     }
 
     let accessToken: string
@@ -219,7 +319,7 @@ export async function dispatchPurchaseToCapi(params: DispatchPurchaseParams) {
       const errorMsg = 'Failed to decrypt pixel access token'
       console.error('[CAPI Service] Erro ao descriptografar access token do Pixel:', e)
       await recordFailedPurchaseEvent(errorMsg, pixel.id)
-      return { sent: false, success: false, reason: 'decrypt_token_failed', error: errorMsg }
+      return { sent: false, success: false, reason: 'decrypt_token_failed', error: errorMsg, eventId }
     }
 
     // 4. Montar evento de Purchase
@@ -297,17 +397,17 @@ export async function dispatchPurchaseToCapi(params: DispatchPurchaseParams) {
     }).catch(err => console.error('[CAPI Service] Erro ao gravar TrackingEvent Purchase:', err))
 
     console.log(`[CAPI Service] Purchase processado para Meta (Pixel ${pixel.pixelId}, Order ${externalId || saleId}, Sucesso: ${isSuccess}):`, capiResult)
-    return { sent: true, success: isSuccess, result: capiResult, pixelId: pixel.pixelId }
+    return { sent: true, success: isSuccess, result: capiResult, pixelId: pixel.pixelId, eventId }
   } catch (error) {
     const errorMsg = error instanceof Error ? error.message : 'Unknown error'
     console.error('[CAPI Service] Erro inesperado no dispatchPurchaseToCapi:', error)
-    if (params?.workspaceId) {
-      const eventId = `purchase_${params.externalId || params.saleId}`
+    const fallbackEventId = resolvedEventId || (params?.workspaceId ? buildPurchaseEventId(params.workspaceId, params.externalId || params.saleId, params.platform) : undefined)
+    if (params?.workspaceId && fallbackEventId) {
       await prisma.trackingEvent.upsert({
-        where: { eventId },
+        where: { eventId: fallbackEventId },
         update: { status: 'failed', capiError: errorMsg },
         create: {
-          eventId,
+          eventId: fallbackEventId,
           workspaceId: params.workspaceId,
           eventName: 'Purchase',
           eventTime: params.approvedAt || new Date(),
@@ -320,7 +420,7 @@ export async function dispatchPurchaseToCapi(params: DispatchPurchaseParams) {
         }
       }).catch(() => {})
     }
-    return { sent: false, success: false, error: errorMsg }
+    return { sent: false, success: false, error: errorMsg, eventId: fallbackEventId }
   }
 }
 
