@@ -785,6 +785,26 @@ describe('Automação CAPI, Decoração Real de Checkout, Roteamento por Produto
     const serverEventId = buildPurchaseEventId(testWorkspaceId, 'kw_123456', 'kiwify')
     assert.equal(browserEventId, serverEventId, 'O event_id gerado pelo navegador DEVE ser 100% idêntico ao do servidor')
 
+    // Caso 1: Plataforma ausente -> Ambos DEVEM usar 'direct'
+    const browserDirect = context.window.utmTrack.buildPurchaseEventId('ws1', '1001', undefined)
+    const serverDirect = buildPurchaseEventId('ws1', '1001', undefined)
+    assert.equal(browserDirect, 'purchase_ws1_direct_1001', 'Navegador sem plataforma deve gerar purchase_ws1_direct_1001')
+    assert.equal(serverDirect, 'purchase_ws1_direct_1001', 'Servidor sem plataforma deve gerar purchase_ws1_direct_1001')
+    assert.equal(browserDirect, serverDirect, 'Plataforma ausente DEVE gerar exatamente o mesmo ID no navegador e servidor')
+
+    // Caso 2: Caracteres especiais no orderId (ex: ABC/123 vs ABC_123)
+    const browserSlash = context.window.utmTrack.buildPurchaseEventId('ws1', 'ABC/123', 'kiwify')
+    const serverSlash = buildPurchaseEventId('ws1', 'ABC/123', 'kiwify')
+    assert.equal(browserSlash, 'purchase_ws1_kiwify_ABC/123', 'Navegador deve preservar / sem substituição')
+    assert.equal(serverSlash, 'purchase_ws1_kiwify_ABC/123', 'Servidor deve preservar / sem substituição')
+    assert.equal(browserSlash, serverSlash, 'Pedido com barra DEVE gerar IDs idênticos no navegador e servidor')
+
+    const browserUnderscore = context.window.utmTrack.buildPurchaseEventId('ws1', 'ABC_123', 'kiwify')
+    const serverUnderscore = buildPurchaseEventId('ws1', 'ABC_123', 'kiwify')
+    assert.equal(browserUnderscore, 'purchase_ws1_kiwify_ABC_123')
+    assert.equal(serverUnderscore, 'purchase_ws1_kiwify_ABC_123')
+    assert.notEqual(browserSlash, browserUnderscore, 'Pedidos distintos ABC/123 e ABC_123 NÃO podem virar o mesmo ID')
+
     // Testar chamada do trackPurchase manual
     const trackedId = context.window.utmTrack.trackPurchase({
       orderId: 'ORD_MANUAL_777',
@@ -1201,6 +1221,198 @@ describe('Automação CAPI, Decoração Real de Checkout, Roteamento por Produto
       if (saleHotmartId) {
         await prisma.saleItem.deleteMany({ where: { saleId: saleHotmartId } })
         await prisma.sale.delete({ where: { id: saleHotmartId } }).catch(() => {})
+      }
+    }
+  })
+
+  // 22. Retry: sem plataforma declarada, bloqueia resolução ambígua de venda entre múltiplos gateways
+  it('22. Retry: sem plataforma declarada, bloqueia resolução ambígua de venda entre múltiplos gateways', async () => {
+    let metaCalls = 0
+    const originalFetch = global.fetch
+    global.fetch = async () => {
+      metaCalls++
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ events_received: 1 })
+      } as any
+    }
+
+    const ambigOrderId = `AMBIG_NO_PLAT_${Date.now()}`
+    const ambigEventId = buildPurchaseEventId(testWorkspaceId, ambigOrderId, undefined)
+
+    let sale1Id: string | null = null
+    let sale2Id: string | null = null
+
+    try {
+      // 1. Criar duas vendas no mesmo workspace com o mesmo ID em gateways diferentes
+      const s1 = await prisma.sale.create({
+        data: {
+          workspaceId: testWorkspaceId,
+          externalId: ambigOrderId,
+          platform: 'kiwify',
+          status: 'approved',
+          grossAmount: 100,
+          netAmount: 90,
+          orderedAt: new Date(),
+          approvedAt: new Date(),
+          items: {
+            create: [{
+              name: 'Produto A Kiwify',
+              productId: testProductA.id,
+              quantity: 1,
+              unitPrice: 100,
+              totalPrice: 100
+            }]
+          }
+        }
+      })
+      sale1Id = s1.id
+
+      const s2 = await prisma.sale.create({
+        data: {
+          workspaceId: testWorkspaceId,
+          externalId: ambigOrderId,
+          platform: 'hotmart',
+          status: 'approved',
+          grossAmount: 200,
+          netAmount: 180,
+          orderedAt: new Date(),
+          approvedAt: new Date(),
+          items: {
+            create: [{
+              name: 'Produto B Hotmart',
+              productId: testProductB.id,
+              quantity: 1,
+              unitPrice: 200,
+              totalPrice: 200
+            }]
+          }
+        }
+      })
+      sale2Id = s2.id
+
+      // 2. Criar evento com status failed, sem pixel e SEM plataforma
+      await prisma.trackingEvent.create({
+        data: {
+          eventId: ambigEventId,
+          workspaceId: testWorkspaceId,
+          pixelId: null,
+          eventName: 'Purchase',
+          eventTime: new Date(),
+          orderId: ambigOrderId,
+          platform: null,
+          value: 100,
+          status: 'failed',
+          retryCount: 0,
+          emailHash: sha256Hash('sem_plataforma@teste.com')
+        }
+      })
+
+      // 3. Executar retry
+      const retryResult = await retryFailedCapiEvents(testWorkspaceId)
+
+      // Deve bloquear a resolução ambígua e NÃO enviar para a Meta
+      assert.equal(metaCalls, 0, 'Nenhuma chamada à Meta deve ser feita em caso de ambiguidade entre múltiplos gateways sem plataforma declarada')
+
+      const finalEvt = await prisma.trackingEvent.findUnique({
+        where: { eventId: ambigEventId }
+      })
+      assert.equal(finalEvt?.status, 'failed', 'Status deve permanecer failed para correção ou intervenção manual')
+      assert.ok(
+        String(finalEvt?.capiError).includes('Resolução ambígua de venda no retry'),
+        'Erro deve indicar explicitamente que a resolução da venda foi bloqueada por ambiguidade'
+      )
+    } finally {
+      global.fetch = originalFetch
+      await prisma.trackingEvent.deleteMany({
+        where: { eventId: ambigEventId }
+      })
+      if (sale1Id) {
+        await prisma.saleItem.deleteMany({ where: { saleId: sale1Id } })
+        await prisma.sale.delete({ where: { id: sale1Id } }).catch(() => {})
+      }
+      if (sale2Id) {
+        await prisma.saleItem.deleteMany({ where: { saleId: sale2Id } })
+        await prisma.sale.delete({ where: { id: sale2Id } }).catch(() => {})
+      }
+    }
+  })
+
+  // 23. Retry: rejeita pixel previamente associado caso ele tenha sido desativado após a falha
+  it('23. Retry: rejeita pixel previamente associado caso ele tenha sido desativado após a falha', async () => {
+    let metaCalls = 0
+    const originalFetch = global.fetch
+    global.fetch = async () => {
+      metaCalls++
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ events_received: 1 })
+      } as any
+    }
+
+    let deactPixelId: string | null = null
+    const deactOrderId = `DEACT_ORDER_${Date.now()}`
+    const deactEventId = buildPurchaseEventId(testWorkspaceId, deactOrderId, 'kiwify')
+
+    try {
+      // 1. Criar um pixel temporário que depois será desativado
+      const deactPixel = await prisma.pixel.create({
+        data: {
+          workspaceId: testWorkspaceId,
+          name: 'Pixel Que Sera Desativado',
+          pixelId: '999999999999999',
+          accessTokenEnc: encrypt('EAABbDeactTokenTest'),
+          status: 'active'
+        }
+      })
+      deactPixelId = deactPixel.id
+
+      // 2. Criar evento com status failed associado a este pixel
+      await prisma.trackingEvent.create({
+        data: {
+          eventId: deactEventId,
+          workspaceId: testWorkspaceId,
+          pixelId: deactPixel.id,
+          eventName: 'Purchase',
+          eventTime: new Date(),
+          orderId: deactOrderId,
+          platform: 'kiwify',
+          value: 120,
+          status: 'failed',
+          retryCount: 0,
+          emailHash: sha256Hash('pixel_desativado@teste.com')
+        }
+      })
+
+      // 3. Desativar o pixel (simulando alteração no painel de configurações do usuário)
+      await prisma.pixel.update({
+        where: { id: deactPixel.id },
+        data: { status: 'inactive' }
+      })
+
+      // 4. Executar fila de retry
+      await retryFailedCapiEvents(testWorkspaceId)
+
+      // 5. Garantir que nenhuma chamada foi feita ao pixel desativado
+      assert.equal(metaCalls, 0, 'O retry JAMAIS deve enviar eventos para um pixel inativo, mesmo que associado no passado')
+
+      const finalEvt = await prisma.trackingEvent.findUnique({
+        where: { eventId: deactEventId }
+      })
+      assert.equal(finalEvt?.status, 'failed', 'O status do evento deve permanecer failed')
+      assert.ok(
+        String(finalEvt?.capiError).includes('inativo') || String(finalEvt?.capiError).includes('não encontrado'),
+        'Erro deve registrar que o pixel está inativo ou não pôde ser utilizado'
+      )
+    } finally {
+      global.fetch = originalFetch
+      await prisma.trackingEvent.deleteMany({
+        where: { eventId: deactEventId }
+      })
+      if (deactPixelId) {
+        await prisma.pixel.delete({ where: { id: deactPixelId } }).catch(() => {})
       }
     }
   })

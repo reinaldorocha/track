@@ -26,16 +26,11 @@ export interface DispatchPurchaseParams {
  * Constrói identificador canônico e globalmente único para eventos de Purchase
  * com escopo por Workspace e Plataforma, garantindo paridade e deduplicação estrita com o tracker.js.
  */
-export function buildPurchaseEventId(workspaceId: string, orderId: string, platform?: string): string {
+export function buildPurchaseEventId(workspaceId: string, orderId: string, platform?: string | null): string {
+  const cleanWs = String(workspaceId || '').trim() || 'default'
+  const cleanPlat = (platform && String(platform).trim().toLowerCase()) || 'direct'
   const cleanOrder = String(orderId || '').trim()
-  const cleanWs = String(workspaceId || '').trim()
-  const cleanPlat = String(platform || '').toLowerCase().trim()
-
-  const parts = ['purchase']
-  if (cleanWs) parts.push(cleanWs)
-  if (cleanPlat) parts.push(cleanPlat)
-  parts.push(cleanOrder)
-  return parts.join('_')
+  return `purchase_${cleanWs}_${cleanPlat}_${cleanOrder}`
 }
 
 export interface DispatchNavigationParams {
@@ -305,19 +300,39 @@ export async function dispatchPurchaseToCapi(params: DispatchPurchaseParams) {
 
     // 1.3 Se não encontrou, verificar se a venda tem items com produto vinculado a um pixel
     if (!pixel && (saleId || externalId)) {
-      const saleWithItem = await prisma.sale.findFirst({
-        where: {
-          workspaceId,
-          OR: [{ id: saleId }, { externalId: externalId }]
-        },
-        include: {
-          items: {
-            include: { product: true }
+      let saleWithItem: any = null
+      if (platform) {
+        saleWithItem = await prisma.sale.findFirst({
+          where: {
+            workspaceId,
+            platform,
+            OR: [{ id: saleId }, { externalId: externalId }]
+          },
+          include: {
+            items: {
+              include: { product: true }
+            }
           }
+        })
+      } else {
+        const matchingSales = await prisma.sale.findMany({
+          where: {
+            workspaceId,
+            OR: [{ id: saleId }, { externalId: externalId }]
+          },
+          include: {
+            items: {
+              include: { product: true }
+            }
+          },
+          take: 2
+        })
+        if (matchingSales.length === 1) {
+          saleWithItem = matchingSales[0]
         }
-      })
+      }
 
-      const itemWithPixel = saleWithItem?.items?.find(it => it.product?.pixelId)
+      const itemWithPixel = saleWithItem?.items?.find((it: any) => it.product?.pixelId)
       const targetPixelId = itemWithPixel?.product?.pixelId
       if (targetPixelId) {
         pixel = activePixels.find(p => p.id === targetPixelId || p.pixelId === targetPixelId) || null
@@ -697,7 +712,12 @@ export async function retryFailedCapiEvents(workspaceId?: string, limit = 20) {
       }
 
       let pixel = evt.pixel
-      // Se não havia pixel associado na falha anterior (ex: ausência ou ambiguidade prévia), tentar resolver agora
+      // 1.1 Verificar se o pixel previamente associado ainda está ativo e possui access token
+      if (pixel && (pixel.status !== 'active' || !pixel.accessTokenEnc)) {
+        pixel = null
+      }
+
+      // 1.2 Se não havia pixel associado ou ele foi desativado posteriormente, tentar resolver agora
       if (!pixel && evt.workspaceId) {
         if (evt.orderId) {
           const effectivePlatform = evt.platform || (
@@ -707,15 +727,43 @@ export async function retryFailedCapiEvents(workspaceId?: string, limit = 20) {
             undefined
           )
 
-          const sale = await prisma.sale.findFirst({
-            where: {
-              workspaceId: evt.workspaceId,
-              ...(effectivePlatform ? { platform: effectivePlatform } : {}),
-              OR: [{ id: evt.orderId }, { externalId: evt.orderId }]
-            },
-            include: { items: { include: { product: true } } }
-          })
-          const itemWithPixel = sale?.items?.find(it => it.product?.pixelId)
+          let sale: any = null
+          if (effectivePlatform) {
+            sale = await prisma.sale.findFirst({
+              where: {
+                workspaceId: evt.workspaceId,
+                platform: effectivePlatform,
+                OR: [{ id: evt.orderId }, { externalId: evt.orderId }]
+              },
+              include: { items: { include: { product: true } } }
+            })
+          } else {
+            // Sem plataforma conhecida: verificar se há múltiplos pedidos para o mesmo ID entre plataformas distintas
+            const matchingSales = await prisma.sale.findMany({
+              where: {
+                workspaceId: evt.workspaceId,
+                OR: [{ id: evt.orderId }, { externalId: evt.orderId }]
+              },
+              include: { items: { include: { product: true } } },
+              take: 2
+            })
+
+            if (matchingSales.length > 1) {
+              await prisma.trackingEvent.update({
+                where: { id: evt.id },
+                data: {
+                  status: 'failed',
+                  capiError: 'Resolução ambígua de venda no retry: múltiplos pedidos encontrados com o mesmo ID em plataformas distintas sem plataforma declarada',
+                  updatedAt: new Date()
+                }
+              }).catch(() => {})
+              continue
+            }
+
+            sale = matchingSales[0] || null
+          }
+
+          const itemWithPixel = sale?.items?.find((it: any) => it.product?.pixelId)
           const targetPixelId = itemWithPixel?.product?.pixelId
           if (targetPixelId) {
             pixel = await prisma.pixel.findFirst({
@@ -733,12 +781,12 @@ export async function retryFailedCapiEvents(workspaceId?: string, limit = 20) {
         }
       }
 
-      if (!pixel || !pixel.accessTokenEnc) {
+      if (!pixel || pixel.status !== 'active' || !pixel.accessTokenEnc) {
         await prisma.trackingEvent.update({
           where: { id: evt.id },
           data: {
             status: 'failed',
-            capiError: 'Pixel não encontrado ou sem access token durante retry',
+            capiError: 'Pixel não encontrado, inativo ou sem access token durante retry',
             updatedAt: new Date()
           }
         }).catch(() => {})

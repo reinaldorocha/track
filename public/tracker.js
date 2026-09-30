@@ -395,11 +395,10 @@
   }
 
   function buildPurchaseEventId(workspaceId, orderId, platform) {
-    var cleanOrder = String(orderId || '').trim().replace(/[^a-zA-Z0-9_-]/g, '_');
-    var cleanWs = String(workspaceId || '').trim().replace(/[^a-zA-Z0-9_-]/g, '_');
-    var cleanPlat = platform ? String(platform).trim().toLowerCase().replace(/[^a-z0-9_-]/g, '_') : 'direct';
-
-    return 'purchase_' + (cleanWs || 'default') + '_' + cleanPlat + '_' + cleanOrder;
+    var cleanWs = String(workspaceId || '').trim() || 'default';
+    var cleanPlat = (platform && String(platform).trim().toLowerCase()) || 'direct';
+    var cleanOrder = String(orderId || '').trim();
+    return 'purchase_' + cleanWs + '_' + cleanPlat + '_' + cleanOrder;
   }
 
   // 3. Detecção e Disparo Automático de Purchase em Páginas de Obrigado / Confirmação com deduplicação CAPI
