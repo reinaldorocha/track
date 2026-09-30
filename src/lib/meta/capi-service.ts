@@ -231,38 +231,77 @@ export async function dispatchPurchaseToCapi(params: DispatchPurchaseParams) {
     }
 
     const recordFailedPurchaseEvent = async (errorMsg: string, pixelDbId?: string | null) => {
-      await prisma.trackingEvent.upsert({
-        where: { eventId },
-        update: {
-          pixelId: pixelDbId || undefined,
-          platform: platform || null,
-          status: 'failed',
-          capiError: errorMsg,
-          updatedAt: new Date()
-        },
-        create: {
-          eventId,
-          workspaceId,
-          pixelId: pixelDbId || null,
-          sessionId: sessionId || null,
-          eventName: 'Purchase',
-          eventTime: approvedAt || new Date(),
-          value: eventValue,
-          currency: currency || 'BRL',
-          orderId: externalId || saleId,
-          platform: platform || null,
-          status: 'failed',
-          capiError: errorMsg,
-          retryCount: 0,
-          clientIp: effectiveIp || null,
-          clientUserAgent: effectiveUserAgent || null,
-          emailHash: userData.em?.[0] || null,
-          phoneHash: userData.ph?.[0] || null,
-          fbp: effectiveFbp || null,
-          fbc: effectiveFbc || null,
-          fbclid: sessionData?.fbclid || null
+      try {
+        await prisma.trackingEvent.upsert({
+          where: { eventId },
+          update: {
+            pixelId: pixelDbId || undefined,
+            platform: platform || null,
+            status: 'failed',
+            capiError: errorMsg,
+            updatedAt: new Date()
+          },
+          create: {
+            eventId,
+            workspaceId,
+            pixelId: pixelDbId || null,
+            sessionId: sessionId || null,
+            eventName: 'Purchase',
+            eventTime: approvedAt || new Date(),
+            value: eventValue,
+            currency: currency || 'BRL',
+            orderId: externalId || saleId,
+            platform: platform || null,
+            status: 'failed',
+            capiError: errorMsg,
+            retryCount: 0,
+            clientIp: effectiveIp || null,
+            clientUserAgent: effectiveUserAgent || null,
+            emailHash: userData.em?.[0] || null,
+            phoneHash: userData.ph?.[0] || null,
+            fbp: effectiveFbp || null,
+            fbc: effectiveFbc || null,
+            fbclid: sessionData?.fbclid || null
+          }
+        })
+      } catch (err) {
+        console.error('[CAPI Service] Erro ao gravar TrackingEvent Purchase falho:', err)
+        // Se a gravação falhou (ex: FK inválida em pixelDbId), garante que o evento seja atualizado para 'failed' sem vínculo de pixel
+        if (pixelDbId) {
+          await prisma.trackingEvent.upsert({
+            where: { eventId },
+            update: {
+              pixelId: undefined,
+              platform: platform || null,
+              status: 'failed',
+              capiError: `${errorMsg} (Falha ao vincular pixelId: ${err instanceof Error ? err.message : String(err)})`,
+              updatedAt: new Date()
+            },
+            create: {
+              eventId,
+              workspaceId,
+              pixelId: null,
+              sessionId: sessionId || null,
+              eventName: 'Purchase',
+              eventTime: approvedAt || new Date(),
+              value: eventValue,
+              currency: currency || 'BRL',
+              orderId: externalId || saleId,
+              platform: platform || null,
+              status: 'failed',
+              capiError: errorMsg,
+              retryCount: 0,
+              clientIp: effectiveIp || null,
+              clientUserAgent: effectiveUserAgent || null,
+              emailHash: userData.em?.[0] || null,
+              phoneHash: userData.ph?.[0] || null,
+              fbp: effectiveFbp || null,
+              fbc: effectiveFbc || null,
+              fbclid: sessionData?.fbclid || null
+            }
+          }).catch(innerErr => console.error('[CAPI Service] Falha ao gravar TrackingEvent sem pixelId:', innerErr))
         }
-      }).catch(err => console.error('[CAPI Service] Erro ao gravar TrackingEvent Purchase falho:', err))
+      }
     }
 
     // 1. Roteamento Inteligente do Pixel:
@@ -273,12 +312,6 @@ export async function dispatchPurchaseToCapi(params: DispatchPurchaseParams) {
         accessTokenEnc: { not: null }
       }
     })
-
-    if (activePixels.length === 0) {
-      const errorMsg = 'No active pixel configured with access token in workspace'
-      await recordFailedPurchaseEvent(errorMsg)
-      return { sent: false, success: false, reason: 'pixel_not_configured', error: errorMsg, eventId }
-    }
 
     let explicitPixelId: string | null = null
 
@@ -347,9 +380,30 @@ export async function dispatchPurchaseToCapi(params: DispatchPurchaseParams) {
       pixel = activePixels.find(p => p.id === explicitPixelId || p.pixelId === explicitPixelId) || null
 
       if (!pixel) {
-        const errorMsg = `O pixel explicitamente vinculado (${explicitPixelId}) está inativo, sem access token ou não pertence ao workspace.`
+        // Resolver o ID interno do banco antes de gravar a falha:
+        // Se explicitPixelId for um ID numérico da Meta (pixel.pixelId) ou id interno (pixel.id),
+        // buscamos no banco para obter o cuid interno (pixel.id) que o TrackingEvent.pixelId exige como foreign key.
+        // Se o pixel não existir no banco, registramos a falha sem preencher a relação (pixelDbId = null)
+        // e guardamos o identificador solicitado na mensagem de erro.
+        const existingPixel = await prisma.pixel.findFirst({
+          where: {
+            workspaceId,
+            OR: [
+              { id: explicitPixelId },
+              { pixelId: explicitPixelId }
+            ]
+          },
+          select: { id: true }
+        })
+
+        const internalPixelDbId = existingPixel?.id || null
+
+        const errorMsg = existingPixel
+          ? `O pixel explicitamente vinculado (${explicitPixelId}) está inativo ou sem access token no workspace.`
+          : `O pixel explicitamente vinculado (${explicitPixelId}) não foi encontrado no workspace.`
+
         console.error(`[CAPI Service] ${errorMsg}`)
-        await recordFailedPurchaseEvent(errorMsg, explicitPixelId)
+        await recordFailedPurchaseEvent(errorMsg, internalPixelDbId)
         return {
           sent: false,
           success: false,
@@ -360,7 +414,11 @@ export async function dispatchPurchaseToCapi(params: DispatchPurchaseParams) {
       }
     } else {
       // 1.4 Resolução Segura de Fallback SOMENTE QUANDO NÃO HÁ VÍNCULO EXPLÍCITO:
-      if (activePixels.length === 1) {
+      if (activePixels.length === 0) {
+        const errorMsg = 'No active pixel configured with access token in workspace'
+        await recordFailedPurchaseEvent(errorMsg)
+        return { sent: false, success: false, reason: 'pixel_not_configured', error: errorMsg, eventId }
+      } else if (activePixels.length === 1) {
         pixel = activePixels[0]
       } else {
         const errorMsg = `Multiple active pixels (${activePixels.length}) exist in workspace, but no pixel is mapped to product/sale (saleId: ${saleId || externalId}). Configure product-to-pixel mapping in settings.`
@@ -531,19 +589,32 @@ export async function dispatchNavigationToCapi(params: DispatchNavigationParams)
     const effectiveFbc = sessionData?.fbc || undefined
 
     const recordFailedNavEvent = async (errorMsg: string, pixelDbId?: string | null) => {
-      await prisma.trackingEvent.updateMany({
-        where: { eventId, workspaceId },
-        data: {
-          pixelId: pixelDbId || undefined,
-          status: 'failed',
-          capiError: errorMsg,
-          clientIp: effectiveIp || null,
-          clientUserAgent: effectiveUserAgent || null,
-          fbp: effectiveFbp || null,
-          fbc: effectiveFbc || null,
-          fbclid: sessionData?.fbclid || null
+      try {
+        await prisma.trackingEvent.updateMany({
+          where: { eventId, workspaceId },
+          data: {
+            pixelId: pixelDbId || undefined,
+            status: 'failed',
+            capiError: errorMsg,
+            clientIp: effectiveIp || null,
+            clientUserAgent: effectiveUserAgent || null,
+            fbp: effectiveFbp || null,
+            fbc: effectiveFbc || null,
+            fbclid: sessionData?.fbclid || null
+          }
+        })
+      } catch (err) {
+        console.error('[CAPI Service] Erro ao gravar TrackingEvent navegação falho:', err)
+        if (pixelDbId) {
+          await prisma.trackingEvent.updateMany({
+            where: { eventId, workspaceId },
+            data: {
+              status: 'failed',
+              capiError: `${errorMsg} (Falha ao vincular pixelId: ${err instanceof Error ? err.message : String(err)})`
+            }
+          }).catch(() => {})
         }
-      }).catch(() => {})
+      }
     }
 
     // Roteamento de Pixel para Navegação:
@@ -555,18 +626,27 @@ export async function dispatchNavigationToCapi(params: DispatchNavigationParams)
       }
     })
 
-    if (activePixels.length === 0) {
-      const errorMsg = 'No active pixel configured with access token in workspace'
-      await recordFailedNavEvent(errorMsg)
-      return { sent: false, success: false, reason: 'pixel_not_configured', error: errorMsg }
-    }
-
     let pixel: typeof activePixels[0] | null = null
     if (directPixelId) {
       pixel = activePixels.find(p => p.id === directPixelId || p.pixelId === directPixelId) || null
       if (!pixel) {
-        const errorMsg = `Pixel ${directPixelId} is not active or not found in workspace`
-        await recordFailedNavEvent(errorMsg)
+        const existingPixel = await prisma.pixel.findFirst({
+          where: {
+            workspaceId,
+            OR: [
+              { id: directPixelId },
+              { pixelId: directPixelId }
+            ]
+          },
+          select: { id: true }
+        })
+
+        const internalPixelDbId = existingPixel?.id || null
+        const errorMsg = existingPixel
+          ? `Pixel ${directPixelId} is not active or lacks access token in workspace`
+          : `Pixel ${directPixelId} is not found in workspace`
+
+        await recordFailedNavEvent(errorMsg, internalPixelDbId)
         return {
           sent: false,
           success: false,
@@ -575,7 +655,11 @@ export async function dispatchNavigationToCapi(params: DispatchNavigationParams)
         }
       }
     } else {
-      if (activePixels.length === 1) {
+      if (activePixels.length === 0) {
+        const errorMsg = 'No active pixel configured with access token in workspace'
+        await recordFailedNavEvent(errorMsg)
+        return { sent: false, success: false, reason: 'pixel_not_configured', error: errorMsg }
+      } else if (activePixels.length === 1) {
         pixel = activePixels[0]
       } else {
         const errorMsg = 'Multiple active pixels in workspace, but no pixel specified for navigation event (missing data-pixel-id)'

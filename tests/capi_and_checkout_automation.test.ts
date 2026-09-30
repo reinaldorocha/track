@@ -1605,4 +1605,88 @@ describe('Automação CAPI, Decoração Real de Checkout, Roteamento por Produto
       }
     }
   })
+
+  // 25. Resolução de ID interno no registro de falha: directPixelId numérico inativo salva ID interno do banco, e pixel inexistente não quebra FK nem deixa evento preso em sending
+  it('25. Resolução de ID interno no registro de falha: directPixelId numérico inativo salva ID interno do banco, e pixel inexistente não quebra FK nem deixa evento preso em sending', async () => {
+    let isoWsId: string | null = null
+    const orderInactiveNumeric = `ORDER_INACTIVE_NUM_${Date.now()}`
+    const orderNonExistent = `ORDER_NONEXISTENT_${Date.now()}`
+
+    try {
+      // 1. Criar workspace isolado
+      const isoWs = await prisma.workspace.create({
+        data: {
+          name: 'Workspace FK Resolution Test',
+          slug: `iso-fk-${Date.now()}`
+        }
+      })
+      isoWsId = isoWs.id
+
+      // Pixel inativo com pixelId numérico da Meta
+      const pixelInactive = await prisma.pixel.create({
+        data: {
+          workspaceId: isoWs.id,
+          name: 'Pixel Inativo Numérico',
+          pixelId: '555555555555555',
+          accessTokenEnc: encrypt('EAABmocktokenInactive'),
+          status: 'inactive'
+        }
+      })
+
+      // CASO A: directPixelId passado como ID numérico de pixel existente porém inativo
+      const resA = await dispatchPurchaseToCapi({
+        workspaceId: isoWs.id,
+        saleId: `sale_${orderInactiveNumeric}`,
+        externalId: orderInactiveNumeric,
+        grossAmount: 150,
+        pixelId: '555555555555555',
+        customerEmail: 'cliente_inativo_num@teste.com'
+      })
+
+      assert.equal(resA.sent, false)
+      assert.equal(resA.reason, 'pixel_inactive_or_missing')
+
+      const eventIdA = buildPurchaseEventId(isoWs.id, orderInactiveNumeric, undefined)
+      const dbEvtA = await prisma.trackingEvent.findUnique({
+        where: { eventId: eventIdA }
+      })
+
+      assert.ok(dbEvtA, 'Evento A deve ter sido gravado')
+      assert.equal(dbEvtA.status, 'failed', 'Evento não deve ficar preso em sending')
+      assert.equal(dbEvtA.pixelId, pixelInactive.id, 'O campo TrackingEvent.pixelId deve receber o ID interno (cuid), não o ID numérico da Meta')
+      assert.ok(String(dbEvtA.capiError).includes('555555555555555'), 'A mensagem de erro deve preservar o identificador solicitado')
+      assert.ok(String(dbEvtA.capiError).includes('inativo'), 'Mensagem deve indicar que o pixel está inativo')
+
+      // CASO B: directPixelId passado como ID numérico de pixel totalmente inexistente no banco
+      const resB = await dispatchPurchaseToCapi({
+        workspaceId: isoWs.id,
+        saleId: `sale_${orderNonExistent}`,
+        externalId: orderNonExistent,
+        grossAmount: 200,
+        pixelId: '999999999999999',
+        customerEmail: 'cliente_inexistente@teste.com'
+      })
+
+      assert.equal(resB.sent, false)
+      assert.equal(resB.reason, 'pixel_inactive_or_missing')
+
+      const eventIdB = buildPurchaseEventId(isoWs.id, orderNonExistent, undefined)
+      const dbEvtB = await prisma.trackingEvent.findUnique({
+        where: { eventId: eventIdB }
+      })
+
+      assert.ok(dbEvtB, 'Evento B deve ter sido gravado')
+      assert.equal(dbEvtB.status, 'failed', 'Evento de pixel inexistente deve ser gravado com status failed e JAMAIS ficar preso em sending')
+      assert.equal(dbEvtB.pixelId, null, 'O campo TrackingEvent.pixelId deve permanecer null quando o pixel não existe no banco, evitando erro de chave estrangeira')
+      assert.ok(String(dbEvtB.capiError).includes('999999999999999'), 'A mensagem de erro deve preservar o identificador solicitado')
+      assert.ok(String(dbEvtB.capiError).includes('não foi encontrado'), 'Mensagem deve indicar que o pixel não foi encontrado no workspace')
+
+    } finally {
+      if (isoWsId) {
+        await prisma.trackingEvent.deleteMany({ where: { workspaceId: isoWsId } })
+        await prisma.pixel.deleteMany({ where: { workspaceId: isoWsId } })
+        await prisma.workspace.delete({ where: { id: isoWsId } }).catch(() => {})
+      }
+    }
+  })
 })
