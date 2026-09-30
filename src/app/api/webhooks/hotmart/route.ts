@@ -165,7 +165,8 @@ export async function POST(req: Request) {
           status,
           grossAmount: grossPrice,
           netAmount: netPrice,
-          isTest: false
+          isTest: false,
+          capi: sale.capiResult
         })
       }
     })
@@ -194,7 +195,8 @@ export async function POST(req: Request) {
       success: true, 
       saleId: sale.id, 
       status: sale.status,
-      isTest: false 
+      isTest: false,
+      capi: sale.capiResult
     })
   } catch (error) {
     console.error('[Hotmart Webhook] Error:', error)

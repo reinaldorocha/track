@@ -24,6 +24,8 @@ export interface InternalSale {
   sessionId?: string
   customerEmail?: string
   customerPhone?: string
+  clientIp?: string
+  clientUserAgent?: string
   orderedAt: Date
   approvedAt?: Date
   refundedAt?: Date
@@ -666,9 +668,10 @@ export async function upsertSale(sale: InternalSale) {
   }
 
   // Disparo automático para Meta Conversions API (CAPI) em vendas aprovadas
+  let capiResult: { sent: boolean; success?: boolean; reason?: string; error?: string; pixelId?: string; result?: unknown } | undefined = undefined
   if (result.status === 'approved') {
     try {
-      await dispatchPurchaseToCapi({
+      capiResult = await dispatchPurchaseToCapi({
         workspaceId: result.workspaceId,
         saleId: result.id,
         externalId: result.externalId,
@@ -680,12 +683,21 @@ export async function upsertSale(sale: InternalSale) {
         fbc: result.fbc || undefined,
         sessionId: result.sessionId || undefined,
         approvedAt: result.approvedAt || new Date(),
-        productId: resolvedProductId || undefined
+        productId: resolvedProductId || undefined,
+        clientIp: sale.clientIp,
+        clientUserAgent: sale.clientUserAgent
       })
+      if (!capiResult?.sent || !capiResult?.success) {
+        console.warn(`[upsertSale] CAPI Purchase not delivered immediately for sale ${result.id}: ${capiResult?.reason || capiResult?.error || 'delivery failed'}. Queued in TrackingEvent with status 'failed' for retry.`)
+      }
     } catch (e) {
       console.error('[upsertSale] CAPI Purchase trigger error:', e)
+      capiResult = { sent: false, success: false, error: e instanceof Error ? e.message : String(e) }
     }
   }
   
-  return result
+  return {
+    ...result,
+    capiResult
+  }
 }

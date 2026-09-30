@@ -718,6 +718,65 @@ describe('Integrações e Normalização de Webhooks', () => {
       process.env.HOTMART_WEBHOOK_SECRET = originalSecret
     }
   })
+
+  it('Segurança Webhooks: Segredo global NÃO autoriza workspace de cliente que possui segredo próprio ou workspace não-padrão', async () => {
+    const { authenticateWebhook } = await import('../src/lib/integrations/webhook-auth')
+    const { prisma } = await import('../src/lib/db')
+
+    // Criar workspace de cliente com segredo próprio
+    const clientWs = await prisma.workspace.create({
+      data: {
+        name: 'Client Workspace Isolated',
+        slug: `client-ws-${Date.now()}`
+      }
+    })
+
+    await prisma.integration.create({
+      data: {
+        workspaceId: clientWs.id,
+        platform: 'hotmart',
+        name: 'Hotmart Cliente',
+        webhookSecret: 'client_specific_secret_999'
+      }
+    })
+
+    try {
+      // 1. Tentar autenticar o workspace do cliente usando o segredo global de ambiente
+      const authWithGlobal = await authenticateWebhook({
+        platform: 'hotmart',
+        providedToken: 'global_env_secret_123',
+        queryWorkspaceId: clientWs.id,
+        globalEnvSecret: 'global_env_secret_123'
+      })
+
+      assert.equal(authWithGlobal.authorized, false, 'Segredo global NÃO deve autorizar workspace com segredo exclusivo')
+      assert.equal(authWithGlobal.status, 401)
+
+      // 2. Autenticar com o segredo exclusivo da integração do cliente
+      const authWithClientSecret = await authenticateWebhook({
+        platform: 'hotmart',
+        providedToken: 'client_specific_secret_999',
+        queryWorkspaceId: clientWs.id,
+        globalEnvSecret: 'global_env_secret_123'
+      })
+
+      assert.equal(authWithClientSecret.authorized, true, 'Segredo exclusivo da integração deve autorizar com sucesso')
+      assert.equal(authWithClientSecret.workspaceId, clientWs.id)
+
+      // 3. Autenticação direta pelo token sem queryWorkspaceId (procura por integração)
+      const authDirectToken = await authenticateWebhook({
+        platform: 'hotmart',
+        providedToken: 'client_specific_secret_999',
+        globalEnvSecret: 'global_env_secret_123'
+      })
+
+      assert.equal(authDirectToken.authorized, true)
+      assert.equal(authDirectToken.workspaceId, clientWs.id)
+    } finally {
+      await prisma.integration.deleteMany({ where: { workspaceId: clientWs.id } })
+      await prisma.workspace.delete({ where: { id: clientWs.id } })
+    }
+  })
 })
 
 

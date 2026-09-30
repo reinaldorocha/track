@@ -16,6 +16,8 @@ export interface DispatchPurchaseParams {
   approvedAt?: Date
   productId?: string
   pixelId?: string
+  clientIp?: string
+  clientUserAgent?: string
 }
 
 export interface DispatchNavigationParams {
@@ -51,10 +53,87 @@ export async function dispatchPurchaseToCapi(params: DispatchPurchaseParams) {
       sessionId,
       approvedAt,
       productId,
-      pixelId: directPixelId
+      pixelId: directPixelId,
+      clientIp,
+      clientUserAgent
     } = params
 
-    if (!workspaceId) return { sent: false, reason: 'missing_workspace_id' }
+    if (!workspaceId) return { sent: false, success: false, reason: 'missing_workspace_id' }
+
+    // 0. Pré-computar sessionData, userData e dados de matching para que QUALQUER falha preserve 100% dos dados
+    let sessionData: { fbclid?: string | null; fbp?: string | null; fbc?: string | null; userAgent?: string | null; ipAddress?: string | null } | null = null
+    if (sessionId) {
+      sessionData = await prisma.trackingSession.findUnique({
+        where: { sessionId },
+        select: { fbclid: true, fbp: true, fbc: true, userAgent: true, ipAddress: true }
+      })
+    }
+
+    const effectiveFbp = fbp || sessionData?.fbp || undefined
+    const effectiveFbc = fbc || sessionData?.fbc || undefined
+    const effectiveIp = clientIp || sessionData?.ipAddress || undefined
+    const effectiveUserAgent = clientUserAgent || sessionData?.userAgent || undefined
+
+    const userData: PixelEvent['user_data'] = {
+      fbp: effectiveFbp,
+      fbc: effectiveFbc,
+      client_ip_address: effectiveIp,
+      client_user_agent: effectiveUserAgent
+    }
+
+    if (customerEmail && customerEmail.trim()) {
+      userData.em = [sha256Hash(customerEmail.toLowerCase().trim())]
+    }
+
+    if (customerPhone && customerPhone.trim()) {
+      const cleanPhone = customerPhone.replace(/\D/g, '')
+      if (cleanPhone.length >= 8) {
+        const formattedPhone = (cleanPhone.length === 10 || cleanPhone.length === 11) ? `55${cleanPhone}` : cleanPhone
+        userData.ph = [sha256Hash(formattedPhone)]
+      }
+    }
+
+    const eventId = `purchase_${externalId || saleId}`
+    const eventValue = (grossAmount !== null && grossAmount !== undefined) ? Number(grossAmount) : 0
+
+    const recordFailedPurchaseEvent = async (errorMsg: string, pixelDbId?: string | null) => {
+      await prisma.trackingEvent.upsert({
+        where: { eventId },
+        update: {
+          pixelId: pixelDbId || undefined,
+          status: 'failed',
+          capiError: errorMsg,
+          clientIp: effectiveIp || null,
+          clientUserAgent: effectiveUserAgent || null,
+          emailHash: userData.em?.[0] || null,
+          phoneHash: userData.ph?.[0] || null,
+          fbp: effectiveFbp || null,
+          fbc: effectiveFbc || null,
+          fbclid: sessionData?.fbclid || null
+        },
+        create: {
+          eventId,
+          workspaceId,
+          pixelId: pixelDbId || null,
+          sessionId: sessionId || null,
+          eventName: 'Purchase',
+          eventTime: approvedAt || new Date(),
+          value: eventValue,
+          currency: currency || 'BRL',
+          orderId: externalId || saleId,
+          status: 'failed',
+          capiError: errorMsg,
+          retryCount: 0,
+          clientIp: effectiveIp || null,
+          clientUserAgent: effectiveUserAgent || null,
+          emailHash: userData.em?.[0] || null,
+          phoneHash: userData.ph?.[0] || null,
+          fbp: effectiveFbp || null,
+          fbc: effectiveFbc || null,
+          fbclid: sessionData?.fbclid || null
+        }
+      }).catch(err => console.error('[CAPI Service] Erro ao gravar TrackingEvent Purchase falho:', err))
+    }
 
     // 1. Roteamento Inteligente do Pixel:
     const activePixels = await prisma.pixel.findMany({
@@ -66,7 +145,9 @@ export async function dispatchPurchaseToCapi(params: DispatchPurchaseParams) {
     })
 
     if (activePixels.length === 0) {
-      return { sent: false, reason: 'pixel_not_configured', error: 'No active pixel configured with access token in workspace' }
+      const errorMsg = 'No active pixel configured with access token in workspace'
+      await recordFailedPurchaseEvent(errorMsg)
+      return { sent: false, success: false, reason: 'pixel_not_configured', error: errorMsg }
     }
 
     let pixel: typeof activePixels[0] | null = null
@@ -109,38 +190,16 @@ export async function dispatchPurchaseToCapi(params: DispatchPurchaseParams) {
     }
 
     // 1.4 Resolução Segura de Fallback:
-    // Se o workspace tem apenas 1 pixel ativo, usamos com segurança.
-    // Se houver mais de 1 pixel ativo e o produto não estiver vinculado, NÃO adivinhar arbitrariamente!
     if (!pixel) {
       if (activePixels.length === 1) {
         pixel = activePixels[0]
       } else {
         const errorMsg = `Multiple active pixels (${activePixels.length}) exist in workspace, but no pixel is mapped to product/sale (saleId: ${saleId || externalId}). Configure product-to-pixel mapping in settings.`
         console.error(`[CAPI Service] ${errorMsg}`)
-
-        const eventId = `purchase_${externalId || saleId}`
-        await prisma.trackingEvent.upsert({
-          where: { eventId },
-          update: {
-            status: 'failed',
-            capiError: errorMsg
-          },
-          create: {
-            eventId,
-            workspaceId,
-            eventName: 'Purchase',
-            eventTime: approvedAt || new Date(),
-            value: Number(grossAmount || 0),
-            currency: currency || 'BRL',
-            orderId: externalId || saleId,
-            status: 'failed',
-            capiError: errorMsg,
-            retryCount: 0
-          }
-        }).catch(() => {})
-
+        await recordFailedPurchaseEvent(errorMsg)
         return {
           sent: false,
+          success: false,
           reason: 'ambiguous_pixel_configuration',
           error: errorMsg
         }
@@ -148,52 +207,23 @@ export async function dispatchPurchaseToCapi(params: DispatchPurchaseParams) {
     }
 
     if (!pixel || !pixel.accessTokenEnc) {
-      return { sent: false, reason: 'pixel_not_configured' }
+      const errorMsg = 'Selected pixel does not have an access token'
+      await recordFailedPurchaseEvent(errorMsg, pixel?.id)
+      return { sent: false, success: false, reason: 'pixel_not_configured', error: errorMsg }
     }
 
     let accessToken: string
     try {
       accessToken = decrypt(pixel.accessTokenEnc)
     } catch (e) {
+      const errorMsg = 'Failed to decrypt pixel access token'
       console.error('[CAPI Service] Erro ao descriptografar access token do Pixel:', e)
-      return { sent: false, reason: 'decrypt_token_failed' }
-    }
-
-    // 2. Buscar dados complementares da sessão de navegação se disponível
-    let sessionData: { fbclid?: string | null; fbp?: string | null; fbc?: string | null; userAgent?: string | null; ipAddress?: string | null } | null = null
-    if (sessionId) {
-      sessionData = await prisma.trackingSession.findUnique({
-        where: { sessionId },
-        select: { fbclid: true, fbp: true, fbc: true, userAgent: true, ipAddress: true }
-      })
-    }
-
-    const effectiveFbp = fbp || sessionData?.fbp || undefined
-    const effectiveFbc = fbc || sessionData?.fbc || undefined
-
-    // 3. Montar dados do usuário com hash SHA-256 obrigatório da Meta
-    const userData: PixelEvent['user_data'] = {
-      fbp: effectiveFbp,
-      fbc: effectiveFbc,
-      client_ip_address: sessionData?.ipAddress || undefined,
-      client_user_agent: sessionData?.userAgent || undefined
-    }
-
-    if (customerEmail && customerEmail.trim()) {
-      userData.em = [sha256Hash(customerEmail.toLowerCase().trim())]
-    }
-
-    if (customerPhone && customerPhone.trim()) {
-      const cleanPhone = customerPhone.replace(/\D/g, '')
-      if (cleanPhone.length >= 8) {
-        const formattedPhone = (cleanPhone.length === 10 || cleanPhone.length === 11) ? `55${cleanPhone}` : cleanPhone
-        userData.ph = [sha256Hash(formattedPhone)]
-      }
+      await recordFailedPurchaseEvent(errorMsg, pixel.id)
+      return { sent: false, success: false, reason: 'decrypt_token_failed', error: errorMsg }
     }
 
     // 4. Montar evento de Purchase
     const eventTime = Math.floor((approvedAt || new Date()).getTime() / 1000)
-    const eventId = `purchase_${externalId || saleId}`
 
     const purchaseEvent: PixelEvent = {
       event_name: 'Purchase',
@@ -202,7 +232,7 @@ export async function dispatchPurchaseToCapi(params: DispatchPurchaseParams) {
       action_source: 'website',
       user_data: userData,
       custom_data: {
-        value: Number(grossAmount || 0),
+        value: eventValue,
         currency: currency || 'BRL',
         order_id: externalId || saleId,
         content_type: 'product'
@@ -233,6 +263,8 @@ export async function dispatchPurchaseToCapi(params: DispatchPurchaseParams) {
         capiResponse: JSON.stringify(capiResult),
         capiError: isSuccess ? null : JSON.stringify(capiResult?.error || 'Nenhum evento aceito pela Meta'),
         sentAt: isSuccess ? new Date() : null,
+        clientIp: effectiveIp || null,
+        clientUserAgent: effectiveUserAgent || null,
         emailHash: userData.em?.[0] || null,
         phoneHash: userData.ph?.[0] || null,
         fbp: effectiveFbp || null,
@@ -246,7 +278,7 @@ export async function dispatchPurchaseToCapi(params: DispatchPurchaseParams) {
         sessionId: sessionId || null,
         eventName: 'Purchase',
         eventTime: approvedAt || new Date(),
-        value: Number(grossAmount || 0),
+        value: eventValue,
         currency: currency || 'BRL',
         orderId: externalId || saleId,
         status: isSuccess ? 'sent' : 'failed',
@@ -254,6 +286,8 @@ export async function dispatchPurchaseToCapi(params: DispatchPurchaseParams) {
         capiError: isSuccess ? null : JSON.stringify(capiResult?.error || 'Nenhum evento aceito pela Meta'),
         sentAt: isSuccess ? new Date() : null,
         retryCount: 0,
+        clientIp: effectiveIp || null,
+        clientUserAgent: effectiveUserAgent || null,
         emailHash: userData.em?.[0] || null,
         phoneHash: userData.ph?.[0] || null,
         fbp: effectiveFbp || null,
@@ -265,8 +299,28 @@ export async function dispatchPurchaseToCapi(params: DispatchPurchaseParams) {
     console.log(`[CAPI Service] Purchase processado para Meta (Pixel ${pixel.pixelId}, Order ${externalId || saleId}, Sucesso: ${isSuccess}):`, capiResult)
     return { sent: true, success: isSuccess, result: capiResult, pixelId: pixel.pixelId }
   } catch (error) {
+    const errorMsg = error instanceof Error ? error.message : 'Unknown error'
     console.error('[CAPI Service] Erro inesperado no dispatchPurchaseToCapi:', error)
-    return { sent: false, error: error instanceof Error ? error.message : 'Unknown error' }
+    if (params?.workspaceId) {
+      const eventId = `purchase_${params.externalId || params.saleId}`
+      await prisma.trackingEvent.upsert({
+        where: { eventId },
+        update: { status: 'failed', capiError: errorMsg },
+        create: {
+          eventId,
+          workspaceId: params.workspaceId,
+          eventName: 'Purchase',
+          eventTime: params.approvedAt || new Date(),
+          value: Number(params.grossAmount || 0),
+          currency: params.currency || 'BRL',
+          orderId: params.externalId || params.saleId,
+          status: 'failed',
+          capiError: errorMsg,
+          retryCount: 0
+        }
+      }).catch(() => {})
+    }
+    return { sent: false, success: false, error: errorMsg }
   }
 }
 
@@ -289,7 +343,36 @@ export async function dispatchNavigationToCapi(params: DispatchNavigationParams)
       pixelId: directPixelId
     } = params
 
-    if (!workspaceId) return { sent: false, reason: 'missing_workspace_id' }
+    if (!workspaceId) return { sent: false, success: false, reason: 'missing_workspace_id' }
+
+    let sessionData: { fbclid?: string | null; fbp?: string | null; fbc?: string | null; userAgent?: string | null; ipAddress?: string | null } | null = null
+    if (sessionId) {
+      sessionData = await prisma.trackingSession.findUnique({
+        where: { sessionId },
+        select: { fbclid: true, fbp: true, fbc: true, userAgent: true, ipAddress: true }
+      })
+    }
+
+    const effectiveIp = clientIp || sessionData?.ipAddress || undefined
+    const effectiveUserAgent = clientUserAgent || sessionData?.userAgent || undefined
+    const effectiveFbp = sessionData?.fbp || undefined
+    const effectiveFbc = sessionData?.fbc || undefined
+
+    const recordFailedNavEvent = async (errorMsg: string, pixelDbId?: string | null) => {
+      await prisma.trackingEvent.updateMany({
+        where: { eventId, workspaceId },
+        data: {
+          pixelId: pixelDbId || undefined,
+          status: 'failed',
+          capiError: errorMsg,
+          clientIp: effectiveIp || null,
+          clientUserAgent: effectiveUserAgent || null,
+          fbp: effectiveFbp || null,
+          fbc: effectiveFbc || null,
+          fbclid: sessionData?.fbclid || null
+        }
+      }).catch(() => {})
+    }
 
     // Roteamento de Pixel para Navegação:
     const activePixels = await prisma.pixel.findMany({
@@ -301,55 +384,59 @@ export async function dispatchNavigationToCapi(params: DispatchNavigationParams)
     })
 
     if (activePixels.length === 0) {
-      return { sent: false, reason: 'pixel_not_configured' }
+      const errorMsg = 'No active pixel configured with access token in workspace'
+      await recordFailedNavEvent(errorMsg)
+      return { sent: false, success: false, reason: 'pixel_not_configured', error: errorMsg }
     }
 
     let pixel: typeof activePixels[0] | null = null
     if (directPixelId) {
       pixel = activePixels.find(p => p.id === directPixelId || p.pixelId === directPixelId) || null
       if (!pixel) {
+        const errorMsg = `Pixel ${directPixelId} is not active or not found in workspace`
+        await recordFailedNavEvent(errorMsg)
         return {
           sent: false,
+          success: false,
           reason: 'pixel_not_found',
-          error: `Pixel ${directPixelId} is not active or not found in workspace`
+          error: errorMsg
         }
       }
     } else {
       if (activePixels.length === 1) {
         pixel = activePixels[0]
       } else {
+        const errorMsg = 'Multiple active pixels in workspace, but no pixel specified for navigation event (missing data-pixel-id)'
+        await recordFailedNavEvent(errorMsg)
         return {
           sent: false,
+          success: false,
           reason: 'ambiguous_pixel_configuration',
-          error: 'Multiple active pixels in workspace, but no pixel specified for navigation event'
+          error: errorMsg
         }
       }
     }
 
     if (!pixel || !pixel.accessTokenEnc) {
-      return { sent: false, reason: 'pixel_not_configured' }
+      const errorMsg = 'Selected pixel does not have an access token'
+      await recordFailedNavEvent(errorMsg, pixel?.id)
+      return { sent: false, success: false, reason: 'pixel_not_configured', error: errorMsg }
     }
 
     let accessToken: string
     try {
       accessToken = decrypt(pixel.accessTokenEnc)
     } catch {
-      return { sent: false, reason: 'decrypt_token_failed' }
-    }
-
-    let sessionData: { fbclid?: string | null; fbp?: string | null; fbc?: string | null; userAgent?: string | null; ipAddress?: string | null } | null = null
-    if (sessionId) {
-      sessionData = await prisma.trackingSession.findUnique({
-        where: { sessionId },
-        select: { fbclid: true, fbp: true, fbc: true, userAgent: true, ipAddress: true }
-      })
+      const errorMsg = 'Failed to decrypt pixel access token'
+      await recordFailedNavEvent(errorMsg, pixel.id)
+      return { sent: false, success: false, reason: 'decrypt_token_failed', error: errorMsg }
     }
 
     const userData: PixelEvent['user_data'] = {
-      fbp: sessionData?.fbp || undefined,
-      fbc: sessionData?.fbc || undefined,
-      client_ip_address: clientIp || sessionData?.ipAddress || undefined,
-      client_user_agent: clientUserAgent || sessionData?.userAgent || undefined
+      fbp: effectiveFbp,
+      fbc: effectiveFbc,
+      client_ip_address: effectiveIp,
+      client_user_agent: effectiveUserAgent
     }
 
     const customData: PixelEvent['custom_data'] = {}
@@ -397,6 +484,8 @@ export async function dispatchNavigationToCapi(params: DispatchNavigationParams)
         capiResponse: JSON.stringify(capiResult),
         capiError: isSuccess ? null : JSON.stringify(capiResult?.error || 'Nenhum evento aceito pela Meta'),
         sentAt: isSuccess ? new Date() : null,
+        clientIp: effectiveIp || null,
+        clientUserAgent: effectiveUserAgent || null,
         fbp: userData.fbp || null,
         fbc: userData.fbc || null,
         fbclid: sessionData?.fbclid || null
@@ -405,8 +494,15 @@ export async function dispatchNavigationToCapi(params: DispatchNavigationParams)
 
     return { sent: true, success: isSuccess, result: capiResult, pixelId: pixel.pixelId }
   } catch (error) {
+    const errorMsg = error instanceof Error ? error.message : 'Unknown error'
     console.error('[CAPI Service] Erro no dispatchNavigationToCapi:', error)
-    return { sent: false, error: error instanceof Error ? error.message : 'Unknown error' }
+    if (params?.eventId && params?.workspaceId) {
+      await prisma.trackingEvent.updateMany({
+        where: { eventId: params.eventId, workspaceId: params.workspaceId },
+        data: { status: 'failed', capiError: errorMsg }
+      }).catch(() => {})
+    }
+    return { sent: false, success: false, error: errorMsg }
   }
 }
 
@@ -488,11 +584,11 @@ export async function retryFailedCapiEvents(workspaceId?: string, limit = 20) {
           ph: evt.phoneHash ? [evt.phoneHash] : undefined,
           fbp: evt.fbp || evt.session?.fbp || undefined,
           fbc: evt.fbc || evt.session?.fbc || undefined,
-          client_ip_address: evt.session?.ipAddress || undefined,
-          client_user_agent: evt.session?.userAgent || undefined
+          client_ip_address: evt.clientIp || evt.session?.ipAddress || undefined,
+          client_user_agent: evt.clientUserAgent || evt.session?.userAgent || undefined
         },
         custom_data: {
-          value: evt.value || undefined,
+          value: (evt.value !== null && evt.value !== undefined) ? evt.value : undefined,
           currency: evt.currency || undefined,
           order_id: evt.orderId || undefined
         }

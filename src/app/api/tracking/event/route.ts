@@ -60,6 +60,12 @@ export async function POST(req: Request) {
       where: { eventId }
     })
 
+    const clientIp = req.headers.get('x-forwarded-for')?.split(',')[0]?.trim() || req.headers.get('x-real-ip') || undefined
+    const clientUserAgent = req.headers.get('user-agent') || undefined
+    const effectiveIp = clientIp || session?.ipAddress || null
+    const effectiveUserAgent = clientUserAgent || session?.userAgent || null
+    const numericValue = (value !== undefined && value !== null && value !== '') ? parseFloat(String(value)) : null
+
     if (!existing) {
       await prisma.trackingEvent.create({
         data: {
@@ -68,13 +74,18 @@ export async function POST(req: Request) {
           pixelId: resolvedPixelDbId,
           sessionId,
           eventName,
-          value: value ? parseFloat(value) : null,
+          value: numericValue,
           currency,
           orderId,
           contentIds: contentIds ? (typeof contentIds === 'string' ? contentIds : JSON.stringify(contentIds)) : null,
           sourceUrl,
           status: 'received',
-          eventTime: new Date()
+          eventTime: new Date(),
+          clientIp: effectiveIp,
+          clientUserAgent: effectiveUserAgent,
+          fbp: session?.fbp || null,
+          fbc: session?.fbc || null,
+          fbclid: session?.fbclid || null
         }
       })
 
@@ -82,9 +93,6 @@ export async function POST(req: Request) {
       // NOTA: Eventos 'Purchase' do navegador NÃO são reenviados aqui via CAPI
       // para evitar duplicidade de compra com o webhook do gateway que já dispara o CAPI oficial.
       if (eventName !== 'Purchase') {
-        const clientIp = req.headers.get('x-forwarded-for')?.split(',')[0]?.trim() || req.headers.get('x-real-ip') || undefined
-        const clientUserAgent = req.headers.get('user-agent') || undefined
-
         try {
           await dispatchNavigationToCapi({
             workspaceId: workspace.id,
@@ -92,11 +100,11 @@ export async function POST(req: Request) {
             eventName,
             eventId,
             sourceUrl,
-            value: value ? parseFloat(value) : undefined,
+            value: numericValue !== null ? numericValue : undefined,
             currency,
             contentIds: contentIds ? (typeof contentIds === 'string' ? contentIds : JSON.stringify(contentIds)) : undefined,
-            clientIp,
-            clientUserAgent,
+            clientIp: effectiveIp || undefined,
+            clientUserAgent: effectiveUserAgent || undefined,
             pixelId
           })
         } catch (err: unknown) {

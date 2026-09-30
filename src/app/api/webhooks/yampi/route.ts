@@ -109,7 +109,7 @@ export async function POST(req: Request) {
       transactionId: orderId,
     }).catch(e => console.error('Notification dispatch error:', e))
 
-    return NextResponse.json({ success: true, saleId: sale.id })
+    return NextResponse.json({ success: true, saleId: sale.id, capi: sale.capiResult })
   } catch (error) {
     console.error('Yampi webhook error:', error)
     return NextResponse.json({ error: 'Internal Server Error' }, { status: 500 })

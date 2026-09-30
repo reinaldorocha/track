@@ -56,7 +56,8 @@ export async function authenticateWebhook(params: WebhookAuthParams): Promise<We
 
     // Se a integração possui webhookSecret configurado
     if (integration?.webhookSecret) {
-      if (token === integration.webhookSecret || (globalEnvSecret && token === globalEnvSecret)) {
+      // O token DEVE bater estritamente com o segredo exclusivo desta integração
+      if (token === integration.webhookSecret) {
         return {
           authorized: true,
           status: 200,
@@ -71,28 +72,24 @@ export async function authenticateWebhook(params: WebhookAuthParams): Promise<We
       }
     }
 
-    // Se a integração não tem segredo próprio mas existe segredo global em ENV
-    if (globalEnvSecret) {
-      if (token === globalEnvSecret) {
-        return {
-          authorized: true,
-          status: 200,
-          workspaceId: workspace.id,
-          integrationId: integration?.id
-        }
-      }
+    // Se a integração NÃO tem segredo próprio cadastrado:
+    // O segredo global do ENV só autoriza se este for o workspace padrão do sistema
+    const defaultWorkspace = await prisma.workspace.findFirst({ orderBy: { createdAt: 'asc' } })
+    const isDefaultWorkspace = defaultWorkspace?.id === workspace.id
+
+    if (globalEnvSecret && token === globalEnvSecret && isDefaultWorkspace) {
       return {
-        authorized: false,
-        status: 401,
-        error: 'Unauthorized: Webhook token does not match environment secret'
+        authorized: true,
+        status: 200,
+        workspaceId: workspace.id,
+        integrationId: integration?.id
       }
     }
 
-    // Se nenhum segredo foi configurado para esse workspace nem no ENV
     return {
       authorized: false,
       status: 401,
-      error: `Unauthorized: No webhook secret configured for workspace ${workspace.id}`
+      error: `Unauthorized: Webhook secret not configured or does not match workspace ${workspace.id}`
     }
   }
 
@@ -114,31 +111,30 @@ export async function authenticateWebhook(params: WebhookAuthParams): Promise<We
     }
   }
 
-  // 3.2 Se o token bate com o segredo global em ENV
+  // 3.2 Se o token bate com o segredo global em ENV, aplica APENAS ao workspace padrão
   if (globalEnvSecret && token === globalEnvSecret) {
-    // Buscar integração ativa dessa plataforma
-    const activeIntegration = await prisma.integration.findFirst({
-      where: {
-        platform: { in: [platform, platform.toLowerCase()] }
-      }
-    })
-
-    if (activeIntegration) {
-      return {
-        authorized: true,
-        status: 200,
-        workspaceId: activeIntegration.workspaceId,
-        integrationId: activeIntegration.id
-      }
-    }
-
-    // Fallback para o workspace padrão
     const defaultWs = await prisma.workspace.findFirst({ orderBy: { createdAt: 'asc' } })
     if (defaultWs) {
+      const defaultIntegration = await prisma.integration.findFirst({
+        where: {
+          workspaceId: defaultWs.id,
+          platform: { in: [platform, platform.toLowerCase()] }
+        }
+      })
+      // Se a integração do workspace padrão tiver um webhookSecret próprio diferente, NÃO aceita o global
+      if (defaultIntegration?.webhookSecret && defaultIntegration.webhookSecret !== token) {
+        return {
+          authorized: false,
+          status: 401,
+          error: 'Unauthorized: Default workspace uses custom webhook secret'
+        }
+      }
+
       return {
         authorized: true,
         status: 200,
-        workspaceId: defaultWs.id
+        workspaceId: defaultWs.id,
+        integrationId: defaultIntegration?.id
       }
     }
   }

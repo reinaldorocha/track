@@ -373,6 +373,8 @@ model TrackingEvent {
   // User data (hashed when sent to Meta)
   emailHash       String?
   phoneHash       String?
+  clientIp        String?
+  clientUserAgent String?
   fbclid          String?
   fbp             String?
   fbc             String?

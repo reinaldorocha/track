@@ -135,7 +135,8 @@ export async function POST(req: Request) {
           orderId,
           status,
           grossAmount: grossPrice,
-          netAmount: netPrice
+          netAmount: netPrice,
+          capi: sale.capiResult
         })
       }
     })
@@ -162,7 +163,8 @@ export async function POST(req: Request) {
       success: true,
       saleId: sale.id,
       status: sale.status,
-      idempotencyKey
+      idempotencyKey,
+      capi: sale.capiResult
     })
   } catch (error) {
     console.error('[Getfy Webhook] Error:', error)

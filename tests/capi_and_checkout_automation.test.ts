@@ -470,4 +470,114 @@ describe('Automação CAPI, Decoração Real de Checkout, Roteamento por Produto
       global.fetch = originalFetch
     }
   })
+
+  // 11. Garantia de retry: Venda sem pixel configurado grava TrackingEvent com status 'failed' para retry
+  it('11. Garantia de retry: Venda em workspace sem pixel grava TrackingEvent failed para reprocessamento', async () => {
+    const emptyWs = await prisma.workspace.create({
+      data: { name: 'Empty Pixel Workspace', slug: `empty-px-${Date.now()}` }
+    })
+
+    try {
+      const result = await dispatchPurchaseToCapi({
+        workspaceId: emptyWs.id,
+        saleId: 'sale_empty_px_1',
+        externalId: 'ext_empty_px_1',
+        grossAmount: 0,
+        customerEmail: 'cliente_gratis@teste.com'
+      })
+
+      assert.equal(result.sent, false)
+      assert.equal(result.reason, 'pixel_not_configured')
+
+      const savedEvt = await prisma.trackingEvent.findUnique({
+        where: { eventId: 'purchase_ext_empty_px_1' }
+      })
+      assert.ok(savedEvt, 'TrackingEvent deve ser persistido mesmo sem pixel')
+      assert.equal(savedEvt.status, 'failed')
+      assert.equal(savedEvt.value, 0)
+      assert.ok(savedEvt.capiError?.includes('pixel'))
+    } finally {
+      await prisma.trackingEvent.deleteMany({ where: { workspaceId: emptyWs.id } })
+      await prisma.workspace.delete({ where: { id: emptyWs.id } })
+    }
+  })
+
+  // 12. Navegação ambígua: workspace com múltiplos pixels sem data-pixel-id atualiza status para failed
+  it('12. Navegação ambígua: sem data-pixel-id em workspace multi-pixel marca TrackingEvent como failed', async () => {
+    const navEventId = `nav_ambig_${Date.now()}`
+    await prisma.trackingEvent.create({
+      data: {
+        eventId: navEventId,
+        workspaceId: testWorkspaceId,
+        eventName: 'PageView',
+        status: 'received',
+        eventTime: new Date()
+      }
+    })
+
+    const result = await dispatchNavigationToCapi({
+      workspaceId: testWorkspaceId,
+      eventName: 'PageView',
+      eventId: navEventId
+    })
+
+    assert.equal(result.sent, false)
+    assert.equal(result.reason, 'ambiguous_pixel_configuration')
+
+    const updatedEvt = await prisma.trackingEvent.findUnique({
+      where: { eventId: navEventId }
+    })
+    assert.ok(updatedEvt)
+    assert.equal(updatedEvt.status, 'failed', 'Evento de navegação não pode ficar como received')
+    assert.ok(updatedEvt.capiError?.includes('Multiple active pixels'))
+  })
+
+  // 13. Retry preserva 100% dos dados: clientIp, clientUserAgent e value: 0
+  it('13. Retry preserva 100% dos dados: clientIp, clientUserAgent e valor 0', async () => {
+    const originalFetch = global.fetch
+    const retryEventId = `purchase_zero_val_${Date.now()}`
+
+    try {
+      await prisma.trackingEvent.create({
+        data: {
+          eventId: retryEventId,
+          workspaceId: testWorkspaceId,
+          pixelId: testPixelA.id,
+          eventName: 'Purchase',
+          eventTime: new Date(),
+          value: 0,
+          currency: 'BRL',
+          orderId: `order_zero_${Date.now()}`,
+          status: 'failed',
+          clientIp: '201.88.99.10',
+          clientUserAgent: 'Mozilla/5.0 Test Browser CAPI',
+          retryCount: 0
+        }
+      })
+
+      let capturedPayload: any = null
+      global.fetch = async (url: any, init: any) => {
+        if (init && init.body) {
+          try {
+            capturedPayload = JSON.parse(String(init.body))?.data?.[0]
+          } catch {}
+        }
+        return {
+          ok: true,
+          status: 200,
+          json: async () => ({ events_received: 1 })
+        } as any
+      }
+
+      const retryRes = await retryFailedCapiEvents(testWorkspaceId, 10)
+      assert.ok(retryRes.succeeded >= 1)
+      assert.ok(capturedPayload, 'Payload de reenvio foi capturado')
+      assert.equal(capturedPayload.user_data?.client_ip_address, '201.88.99.10')
+      assert.equal(capturedPayload.user_data?.client_user_agent, 'Mozilla/5.0 Test Browser CAPI')
+      assert.equal(capturedPayload.custom_data?.value, 0, 'Valor zero deve ser preservado numericamente, não undefined')
+    } finally {
+      global.fetch = originalFetch
+      await prisma.trackingEvent.deleteMany({ where: { eventId: retryEventId } })
+    }
+  })
 })
