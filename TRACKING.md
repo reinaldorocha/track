@@ -15,29 +15,45 @@ A área de **UTMs & Tracking** (`/integrations/utm`) atua como a central de conf
 
 O `tracker.js` é um script vanilla JavaScript ultra-leve (< 3KB), autônomo, não dependente de bibliotecas externas e projetado para nunca travar a renderização da página (carregamento assíncrono via atributo `async`).
 
-### Instalação na Página de Vendas (Landing Page)
+### Instalação Unificada na Página de Vendas (Landing Page)
+Para o fluxo **Anúncio → Página de Vendas → Checkout → Fim (sem página de obrigado)**, cole apenas este único script no `<head>` da sua Landing Page:
+
 ```html
 <script 
-  src="https://utm-track-navy.vercel.app/tracker.js" 
-  data-api-url="https://utm-track-navy.vercel.app" 
+  src="https://SEU-DOMINIO-TRACK/tracker.js" 
+  data-api-url="https://SEU-DOMINIO-TRACK" 
   data-workspace-id="ID_DO_SEU_WORKSPACE" 
+  data-pixel-id="ID_NUMERICO_DO_META_PIXEL" 
   async
 ></script>
 ```
 
-### Instalação na Página de Obrigado (Thank You Page / Deduplicação CAPI)
-Para garantir 100% de paridade determinística e deduplicação no Meta Pixel com a Conversions API (CAPI), instale o script na página de confirmação/obrigado configurando `data-platform` e `data-pixel-id` explicitamente:
+#### O que o Script Unificado faz automaticamente:
+1. **Carrega o SDK Oficial da Meta (`fbevents.js`)**: Injeta a tag do SDK da Meta de forma segura e assíncrona caso ainda não exista no documento.
+2. **Inicializa o Pixel com Segurança**: Chama `fbq('init', pixelId)` uma única vez, sem disparar PageView genérico duplo.
+3. **Disparos Sincronizados com Deduplicação (`trackSingle`)**: Dispara `PageView` no carregamento e `InitiateCheckout` no clique de qualquer botão/link de checkout tanto no navegador (`fbq('trackSingle', ...)`) quanto no servidor (`/api/tracking/event` → CAPI) com o **mesmo `event_id`**.
+4. **Resiliência a AdBlockers**: Se o SDK da Meta for bloqueado ou falhar na rede, a página continua funcionando normalmente: UTMs são salvas por 30 dias, checkouts são decorados e os eventos continuam sendo entregues via CAPI pelo servidor.
+5. **Prevenção de Duplicação**: Se o script for incluído mais de uma vez na página, a execução subsequente é interrompida silenciosamente via `window.__utmTrackLoaded`.
+6. **Modo Externo / GTM (`data-auto-pixel="false"`)**: Se você já gerencia o Pixel via Google Tag Manager (GTM) ou apps do construtor, adicione `data-auto-pixel="false"` para desativar o carregamento do SDK. Certifique-se de coordenar ou desativar o disparo de PageView padrão do construtor para evitar duplicações no Meta Events Manager.
+
+### Fluxo sem Página de Obrigado (Checkout Direto)
+Quando o checkout não redireciona para uma página de obrigado sua, a compra (`Purchase`) é confirmada **exclusivamente no servidor**:
+1. O `tracker.js` decora o link do checkout com `_utmt_sid`, `_utmt_vid`, `fbclid`, `_fbp`, `_fbc` e UTMs.
+2. O webhook da plataforma (Kiwify, Hotmart, Eduzz, etc.) avisa o UTM-Track da venda aprovada.
+3. O UTM-Track processa a venda e dispara o evento `Purchase` diretamente para a Meta via Conversions API (CAPI) utilizando o token criptografado do workspace.
+
+### Instalação na Página de Obrigado (Apenas se houver página de confirmação no domínio próprio)
+Caso utilize página de obrigado própria no seu domínio:
 ```html
 <script 
-  src="https://utm-track-navy.vercel.app/tracker.js" 
-  data-api-url="https://utm-track-navy.vercel.app" 
+  src="https://SEU-DOMINIO-TRACK/tracker.js" 
+  data-api-url="https://SEU-DOMINIO-TRACK" 
   data-workspace-id="ID_DO_SEU_WORKSPACE" 
-  data-pixel-id="ID_DO_META_PIXEL"
+  data-pixel-id="ID_NUMERICO_DO_META_PIXEL"
   data-platform="kiwify" <!-- ou "hotmart", "cakto", "yampi", "getfy", "shopify" -->
   async
 ></script>
 ```
-Dessa forma, o navegador gera deterministicamente o mesmo `event_id` (`purchase_<workspace>_<platform>_<orderId>`) que o servidor gera no processamento dos webhooks, eliminando duplicidade no Meta Events Manager.
 
 ---
 

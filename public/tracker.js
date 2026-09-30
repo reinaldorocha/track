@@ -1,6 +1,14 @@
 ;(function() {
   'use strict';
   
+  // Prevenir execução duplicada se o tracker for incluído mais de uma vez na mesma página
+  if (typeof window !== 'undefined') {
+    if (window.__utmTrackLoaded) {
+      return;
+    }
+    window.__utmTrackLoaded = true;
+  }
+
   function getParam(name) {
     var match = RegExp('[?&]' + name + '=([^&]*)').exec(window.location.search);
     return match && decodeURIComponent(match[1].replace(/\+/g, ' '));
@@ -21,15 +29,27 @@
   var ttlParsed = parseInt(campaignTtlAttr || (metaTtlTag && metaTtlTag.getAttribute('content')) || (typeof window !== 'undefined' && (window.UTM_TRACK_CAMPAIGN_TTL_DAYS || window.UTM_CAMPAIGN_TTL_DAYS)) || '30', 10);
   var campaignTtlDays = (!isNaN(ttlParsed) && ttlParsed > 0) ? ttlParsed : 30;
 
+  var autoPixelAttr = script && (script.getAttribute('data-auto-pixel') || script.getAttribute('data-load-pixel'));
+  var isAutoPixelEnabled = autoPixelAttr !== 'false' && autoPixelAttr !== '0' && autoPixelAttr !== 'off';
+
+  var rawPixelId = (script && (script.getAttribute('data-pixel-id') || script.getAttribute('data-pixel'))) ||
+                   (metaPixelTag && metaPixelTag.getAttribute('content')) ||
+                   (typeof window !== 'undefined' && (window.UTM_TRACK_PIXEL_ID || window.UTM_PIXEL_ID)) ||
+                   getParam('pixel_id') ||
+                   getParam('pixelId') ||
+                   '';
+  var pixelId = typeof rawPixelId === 'string' ? rawPixelId.trim() : String(rawPixelId || '').trim();
+
+  var consentAttr = script && (script.getAttribute('data-consent') || script.getAttribute('data-consent-status'));
+  var isConsentRevoked = consentAttr === 'revoke' || consentAttr === 'denied' || consentAttr === 'false' ||
+                         (typeof window !== 'undefined' && window.UTM_TRACK_CONSENT === false);
+
   var config = {
     apiUrl: (script && script.getAttribute('data-api-url')) || '',
     workspaceId: (script && script.getAttribute('data-workspace-id')) || '',
-    pixelId: (script && (script.getAttribute('data-pixel-id') || script.getAttribute('data-pixel'))) ||
-             (metaPixelTag && metaPixelTag.getAttribute('content')) ||
-             (typeof window !== 'undefined' && (window.UTM_TRACK_PIXEL_ID || window.UTM_PIXEL_ID)) ||
-             getParam('pixel_id') ||
-             getParam('pixelId') ||
-             '',
+    pixelId: pixelId,
+    autoPixel: isAutoPixelEnabled,
+    consentRevoked: isConsentRevoked,
     platform: (script && (script.getAttribute('data-platform') || script.getAttribute('data-gateway'))) ||
               (platformTag && platformTag.getAttribute('content')) ||
               (typeof window !== 'undefined' && (window.UTM_TRACK_PLATFORM || window.UTM_PLATFORM)) ||
@@ -268,7 +288,79 @@
     return 'evt_' + Date.now().toString(36) + Math.random().toString(36).substr(2, 8);
   }
 
-  // Disparo sincronizado com Meta Pixel no Navegador (se instalado) com o MESMO event_id
+  // =========================================================================
+  // CARREGAMENTO AUTOMÁTICO DO SDK META PIXEL (fbevents.js) & DEDUPLICAÇÃO
+  // =========================================================================
+  function initMetaPixel() {
+    if (!config.autoPixel || !config.pixelId) return;
+
+    try {
+      // 1. Reutilizar window.fbq se já existir; caso contrário, inicializar o stub padrão oficial
+      if (typeof window.fbq !== 'function') {
+        var fbq = function() {
+          if (fbq.callMethod) {
+            fbq.callMethod.apply(fbq, arguments);
+          } else {
+            fbq.queue.push(arguments);
+          }
+        };
+        if (!window._fbq) window._fbq = fbq;
+        fbq.push = fbq;
+        fbq.loaded = true;
+        fbq.version = '2.0';
+        fbq.queue = [];
+        window.fbq = fbq;
+
+        // Injetar script oficial fbevents.js apenas se ainda não existir no documento
+        if (typeof document !== 'undefined' && typeof document.createElement === 'function') {
+          var existingScript = document.querySelector && document.querySelector('script[src*="connect.facebook.net"][src*="fbevents.js"]');
+          if (!existingScript) {
+            var s = document.createElement('script');
+            s.async = true;
+            s.src = 'https://connect.facebook.net/en_US/fbevents.js';
+            s.onerror = function() {
+              if (typeof console !== 'undefined' && console.warn) {
+                console.warn('[UTM-Track] Falha ao carregar SDK fbevents.js da Meta (bloqueado por AdBlock ou offline). O rastreamento próprio e CAPI continuam funcionando.');
+              }
+            };
+            var headElements = typeof document.getElementsByTagName === 'function' ? document.getElementsByTagName('head') : [];
+            var scriptElements = typeof document.getElementsByTagName === 'function' ? document.getElementsByTagName('script') : [];
+            var targetNode = (document.head) ||
+                             (headElements && headElements[0]) ||
+                             (scriptElements && scriptElements[0] && scriptElements[0].parentNode) ||
+                             document.documentElement;
+            if (targetNode) {
+              if (targetNode.insertBefore && targetNode.firstChild) {
+                targetNode.insertBefore(s, targetNode.firstChild);
+              } else if (targetNode.appendChild) {
+                targetNode.appendChild(s);
+              }
+            }
+          }
+        }
+      }
+
+      // 2. Respeitar controle de consentimento se explicitamente informado
+      if (config.consentRevoked && typeof window.fbq === 'function') {
+        try {
+          window.fbq('consent', 'revoke');
+        } catch(e) {}
+      }
+
+      // 3. Inicializar o Pixel numérico informado uma única vez (SEM disparar PageView genérico!)
+      window.__utmTrackInitializedPixels = window.__utmTrackInitializedPixels || {};
+      if (!window.__utmTrackInitializedPixels[config.pixelId] && typeof window.fbq === 'function') {
+        window.fbq('init', config.pixelId);
+        window.__utmTrackInitializedPixels[config.pixelId] = true;
+      }
+    } catch(err) {
+      if (typeof console !== 'undefined' && console.warn) {
+        console.warn('[UTM-Track] Erro na inicialização do Meta Pixel:', err);
+      }
+    }
+  }
+
+  // Disparo sincronizado com Meta Pixel no Navegador com o MESMO event_id
   function fireBrowserPixel(eventName, customData, eventId, targetPixel) {
     try {
       if (typeof window.fbq === 'function') {
@@ -432,6 +524,9 @@
   // 3. INICIALIZAÇÃO DE SESSÃO E DISPARO DE EVENTOS
   // =========================================================================
   
+  // Inicializar o Pixel antes de enfileirar qualquer evento de navegação
+  initMetaPixel();
+
   // Registrar Sessão no Backend
   send('/api/tracking/session', {
     sessionId: sessionId,
@@ -452,7 +547,7 @@
   
   // Disparar PageView (Sincronizado entre Navegador e Servidor com o mesmo eventId)
   var pageViewEventId = genEventId();
-  fireBrowserPixel('PageView', {}, pageViewEventId);
+  fireBrowserPixel('PageView', {}, pageViewEventId, config.pixelId);
   send('/api/tracking/event', {
     sessionId: sessionId,
     workspaceId: config.workspaceId,
@@ -479,7 +574,7 @@
       }
 
       var icEventId = genEventId();
-      fireBrowserPixel('InitiateCheckout', { content_ids: [decorated] }, icEventId);
+      fireBrowserPixel('InitiateCheckout', { content_ids: [decorated] }, icEventId, config.pixelId);
 
       send('/api/tracking/event', {
         sessionId: sessionId,
@@ -645,9 +740,11 @@
     buildPurchaseEventId: buildPurchaseEventId,
     detectPlatform: detectPlatform,
     decorateUrl: decorateUrl,
+    initMetaPixel: initMetaPixel,
     sessionId: sessionId,
     visitorId: visitorId,
     pixelId: config.pixelId,
+    autoPixel: config.autoPixel,
     utms: utms,
     campaignTtlDays: campaignTtlDays
   };

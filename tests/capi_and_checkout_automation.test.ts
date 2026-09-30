@@ -1909,6 +1909,7 @@ describe('Automação CAPI, Decoração Real de Checkout, Roteamento por Produto
             return []
           },
           querySelector: () => null,
+          createElement: () => ({ setAttribute: () => {}, getAttribute: () => null }),
           addEventListener: () => {},
           removeEventListener: () => {},
           get cookie() { return cookieJar },
@@ -2345,5 +2346,374 @@ describe('Automação CAPI, Decoração Real de Checkout, Roteamento por Produto
       await prisma.sale.deleteMany({ where: { workspaceId: testWorkspaceId } }).catch(() => {})
       await prisma.trackingSession.deleteMany({ where: { workspaceId: testWorkspaceId } }).catch(() => {})
     }
+  })
+
+  // ---------------------------------------------------------------------------
+  // 28. Carregamento Automático do Meta Pixel (fbevents.js) pelo tracker.js:
+  // - SDK Ausente: cria stub fbq, injeta script oficial fbevents.js, chama init e trackSingle com eventID sem PageView duplo
+  // - fbq Pré-existente: reaproveita sem duplicar script tag, chamando init e trackSingle
+  // - Inclusão Duplicada do Tracker: previne execução duplicada via __utmTrackLoaded sem disparar PageView duplo nem duplicar listeners
+  // - Destino com Múltiplos Pixels: isolamento estrito via trackSingle garantindo que apenas o pixel configurado receba os eventos
+  // - Igualdade dos event_ids: paridade determinística 100% entre chamada de navegador (fbq) e CAPI (/api/tracking/event) para PageView e InitiateCheckout
+  // - Falha / Bloqueio no carregamento do SDK (onerror / AdBlocker): resiliência total, mantendo sessão, persistência, decoração e envio de eventos
+  // - Flag data-auto-pixel='false': não injeta SDK nem cria fbq quando desativado explicitamente
+  // ---------------------------------------------------------------------------
+  it('28. Carregamento Automático do Meta Pixel (fbevents.js) pelo tracker.js: SDK ausente, fbq existente, inclusão duplicada, múltiplos pixels, igualdade de event_ids, falha do SDK e data-auto-pixel=false', async () => {
+    const trackerPath = path.join(__dirname, '..', 'public', 'tracker.js')
+    const trackerCode = fs.readFileSync(trackerPath, 'utf8')
+
+    function createTestEnv(options: {
+      url?: string
+      scriptAttrs?: Record<string, string>
+      initialFbq?: any
+      simulateSdkFailure?: boolean
+      domElements?: Array<{ tag: string; attrs: Record<string, string | undefined> }>
+    }) {
+      const mockStorage: Record<string, string> = {}
+      const mockSession: Record<string, string> = {}
+      const sentBeacons: Array<{ url: string; data: any; rawText?: string }> = []
+      const createdScripts: Array<{ src?: string; async?: boolean; onerror?: any; onload?: any }> = []
+      const eventListeners: Record<string, Array<(e: any) => void>> = {}
+
+      const scriptAttrs: Record<string, string> = {
+        'data-api-url': 'https://track.test',
+        'data-workspace-id': testWorkspaceId,
+        'data-pixel-id': '987654321098765',
+        ...(options.scriptAttrs || {})
+      }
+
+      const mockScript = {
+        getAttribute: (attr: string) => scriptAttrs[attr] || null,
+        parentNode: {
+          insertBefore: (node: any) => { createdScripts.push(node) }
+        }
+      }
+
+      const elements = (options.domElements || []).map(el => {
+        let hrefVal = el.attrs['href'] || ''
+        let actionVal = el.attrs['action'] || ''
+        let srcVal = el.attrs['src'] || ''
+        const item: any = {
+          tagName: el.tag.toUpperCase(),
+          getAttribute: (name: string) => {
+            if (name === 'href') return hrefVal
+            if (name === 'action') return actionVal
+            if (name === 'src') return srcVal
+            return el.attrs[name] || null
+          },
+          setAttribute: (name: string, val: string) => {
+            if (name === 'href') hrefVal = val
+            if (name === 'action') actionVal = val
+            if (name === 'src') srcVal = val
+            el.attrs[name] = val
+          },
+          get href() { return hrefVal },
+          set href(val: string) { hrefVal = val; el.attrs['href'] = val },
+          get action() { return actionVal },
+          set action(val: string) { actionVal = val; el.attrs['action'] = val },
+          get src() { return srcVal },
+          set src(val: string) { srcVal = val; el.attrs['src'] = val },
+          parentElement: null
+        }
+        return item
+      })
+
+      const parsedUrl = new URL(options.url || 'https://meusite.com.br/landing?utm_source=facebook&utm_campaign=pixel_test')
+
+      const mockHead: any = {
+        firstChild: null,
+        insertBefore: (newNode: any) => {
+          createdScripts.push(newNode)
+          if (options.simulateSdkFailure && typeof newNode.onerror === 'function') {
+            newNode.onerror(new Error('Network error / blocked by client'))
+          }
+          return newNode
+        },
+        appendChild: (newNode: any) => {
+          createdScripts.push(newNode)
+          if (options.simulateSdkFailure && typeof newNode.onerror === 'function') {
+            newNode.onerror(new Error('Network error / blocked by client'))
+          }
+          return newNode
+        }
+      }
+
+      const context: any = {
+        window: {} as any,
+        addEventListener: (event: string, fn: any) => {
+          eventListeners[event] = eventListeners[event] || []
+          eventListeners[event].push(fn)
+        },
+        removeEventListener: () => {},
+        document: {
+          currentScript: mockScript,
+          head: mockHead,
+          documentElement: mockHead,
+          getElementsByTagName: (tag: string) => {
+            if (tag === 'script') return [mockScript]
+            if (tag === 'head') return [mockHead]
+            return []
+          },
+          querySelectorAll: (sel: string) => {
+            if (sel.includes('a[href]')) return elements.filter(e => e.tagName === 'A')
+            if (sel.includes('form[action]')) return elements.filter(e => e.tagName === 'FORM')
+            if (sel.includes('iframe[src]')) return elements.filter(e => e.tagName === 'IFRAME')
+            return []
+          },
+          querySelector: (sel: string) => {
+            if (sel.includes('fbevents.js')) {
+              return createdScripts.find(s => s.src?.includes('fbevents.js')) || null
+            }
+            return null
+          },
+          createElement: (tag: string) => {
+            if (tag === 'script') {
+              const s: any = {
+                src: '',
+                async: false,
+                onerror: null,
+                onload: null
+              }
+              return s
+            }
+            return {}
+          },
+          addEventListener: (event: string, fn: any) => {
+            eventListeners[event] = eventListeners[event] || []
+            eventListeners[event].push(fn)
+          },
+          removeEventListener: () => {},
+          cookie: '',
+          referrer: 'https://facebook.com'
+        },
+        location: {
+          href: parsedUrl.href,
+          pathname: parsedUrl.pathname,
+          search: parsedUrl.search
+        },
+        navigator: {
+          userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+          sendBeacon: (url: string, data: any) => {
+            const rawText = data?.payloadText || (typeof data === 'string' ? data : '')
+            sentBeacons.push({ url, data, rawText })
+            return true
+          }
+        },
+        sessionStorage: {
+          getItem: (k: string) => mockSession[k] || null,
+          setItem: (k: string, v: string) => { mockSession[k] = String(v) },
+          removeItem: (k: string) => { delete mockSession[k] }
+        },
+        localStorage: {
+          getItem: (k: string) => mockStorage[k] || null,
+          setItem: (k: string, v: string) => { mockStorage[k] = String(v) },
+          removeItem: (k: string) => { delete mockStorage[k] }
+        },
+        Date: Date,
+        Math: Math,
+        URL: URL,
+        RegExp: RegExp,
+        parseFloat: parseFloat,
+        parseInt: parseInt,
+        Number: Number,
+        String: String,
+        JSON: JSON,
+        console: {
+          warn: () => {},
+          error: () => {},
+          log: () => {}
+        },
+        Blob: class MockBlob {
+          public payloadText: string
+          constructor(parts: any[]) {
+            this.payloadText = Array.isArray(parts) ? parts.join('') : String(parts || '')
+          }
+          async text() { return this.payloadText }
+          toString() { return this.payloadText }
+        },
+        fetch: async (url: string, opts: any) => {
+          return { ok: true, json: async () => ({ success: true }) }
+        }
+      }
+      context.window = context
+      if (options.initialFbq !== undefined) {
+        context.window.fbq = options.initialFbq
+      }
+
+      vm.createContext(context)
+      return { context, createdScripts, eventListeners, sentBeacons, mockStorage, mockSession, elements }
+    }
+
+    // -------------------------------------------------------------------------
+    // CENÁRIO 1: SDK Ausente -> Carrega SDK, cria stub fbq, executa init e trackSingle
+    // -------------------------------------------------------------------------
+    const env1 = createTestEnv({ scriptAttrs: { 'data-pixel-id': '987654321098765' } })
+    vm.runInContext(trackerCode, env1.context)
+
+    assert.ok(typeof env1.context.window.fbq === 'function', 'Cenário 1: Stub fbq criado')
+    assert.equal(env1.context.window.fbq.loaded, true, 'Cenário 1: fbq.loaded marcado como true')
+    assert.equal(env1.createdScripts.length, 1, 'Cenário 1: Injeta tag de script do SDK da Meta')
+    assert.ok(env1.createdScripts[0].src?.includes('connect.facebook.net/en_US/fbevents.js'), 'Cenário 1: URL aponta para fbevents.js oficial')
+    assert.equal(env1.createdScripts[0].async, true, 'Cenário 1: Script carregado de forma assíncrona')
+
+    const q1 = env1.context.window.fbq.queue
+    assert.ok(Array.isArray(q1), 'Cenário 1: Fila queue disponível')
+    assert.equal(q1[0][0], 'init', 'Cenário 1: Primeiro comando é init')
+    assert.equal(q1[0][1], '987654321098765', 'Cenário 1: fbq("init") chamado com o ID numérico informado')
+    assert.equal(q1[1][0], 'trackSingle', 'Cenário 1: Disparo de PageView utiliza trackSingle')
+    assert.equal(q1[1][1], '987654321098765', 'Cenário 1: trackSingle direcionado ao Pixel configurado')
+    assert.equal(q1[1][2], 'PageView', 'Cenário 1: Nome do evento é PageView')
+    assert.ok(q1[1][4]?.eventID, 'Cenário 1: eventID gerado para deduplicação')
+    assert.ok(!q1.some((item: any) => item[0] === 'track' && item[1] === 'PageView'), 'Cenário 1: NÃO dispara PageView genérico duplo')
+
+    const navBeacon1 = env1.sentBeacons.find(b => b.url.includes('/api/tracking/event'))
+    assert.ok(navBeacon1, 'Cenário 1: Beacon enviado ao backend')
+    const payload1 = JSON.parse(navBeacon1.rawText || '{}')
+    assert.equal(payload1.eventId, q1[1][4].eventID, 'Cenário 1: event_id do navegador e do backend são rigorosamente idênticos')
+    assert.equal(payload1.pixelId, '987654321098765', 'Cenário 1: Pixel ID numérico repassado ao backend')
+
+    // -------------------------------------------------------------------------
+    // CENÁRIO 2: fbq Pré-existente -> Reaproveita sem injetar script tag duplicada
+    // -------------------------------------------------------------------------
+    const existingCalls: any[] = []
+    const mockFbq = function(...args: any[]) { existingCalls.push(args) }
+    const env2 = createTestEnv({
+      initialFbq: mockFbq,
+      scriptAttrs: { 'data-pixel-id': '111222333444555' }
+    })
+    vm.runInContext(trackerCode, env2.context)
+
+    assert.equal(env2.createdScripts.length, 0, 'Cenário 2: NÃO injeta novo script fbevents.js quando fbq já existe')
+    assert.equal(env2.context.window.fbq, mockFbq, 'Cenário 2: Mantém a instância preexistente de fbq')
+    assert.ok(existingCalls.some(c => c[0] === 'init' && c[1] === '111222333444555'), 'Cenário 2: Inicializa o Pixel na instância existente')
+    assert.ok(existingCalls.some(c => c[0] === 'trackSingle' && c[1] === '111222333444555' && c[2] === 'PageView'), 'Cenário 2: Dispara trackSingle na instância existente')
+
+    // -------------------------------------------------------------------------
+    // CENÁRIO 3: Inclusão Duplicada do Tracker na mesma página -> Idempotência via __utmTrackLoaded
+    // -------------------------------------------------------------------------
+    const env3 = createTestEnv({ scriptAttrs: { 'data-pixel-id': '333333333333333' } })
+    vm.runInContext(trackerCode, env3.context)
+    const beaconsCount1 = env3.sentBeacons.length
+    const queueLen1 = env3.context.window.fbq.queue.length
+    assert.equal(env3.context.window.__utmTrackLoaded, true, 'Cenário 3: Marca flag __utmTrackLoaded')
+
+    // Executar o tracker pela segunda vez no mesmo contexto de janela
+    vm.runInContext(trackerCode, env3.context)
+    assert.equal(env3.sentBeacons.length, beaconsCount1, 'Cenário 3: Segunda inclusão NÃO envia beacons adicionais')
+    assert.equal(env3.context.window.fbq.queue.length, queueLen1, 'Cenário 3: Segunda inclusão NÃO enfileira eventos adicionais')
+
+    // -------------------------------------------------------------------------
+    // CENÁRIO 4: Destino com Múltiplos Pixels -> Isolamento estrito via trackSingle
+    // -------------------------------------------------------------------------
+    const multiCalls: any[] = []
+    const multiFbq = function(...args: any[]) { multiCalls.push(args) }
+    const domMulti = [
+      { tag: 'a', attrs: { href: 'https://pay.kiwify.com.br/checkout_multi' } }
+    ]
+    const env4 = createTestEnv({
+      initialFbq: multiFbq,
+      scriptAttrs: { 'data-pixel-id': '777777777777777' },
+      domElements: domMulti
+    })
+    vm.runInContext(trackerCode, env4.context)
+
+    // Simular clique de checkout para disparar InitiateCheckout
+    const clickListeners4 = env4.eventListeners['click'] || []
+    for (const listener of clickListeners4) {
+      listener({ target: env4.elements[0] })
+    }
+
+    const trackSingleCalls4 = multiCalls.filter(c => c[0] === 'trackSingle')
+    assert.ok(trackSingleCalls4.length >= 2, 'Cenário 4: PageView e InitiateCheckout chamam trackSingle')
+    for (const call of trackSingleCalls4) {
+      assert.equal(call[1], '777777777777777', 'Cenário 4: Todos os eventos trackSingle são roteados para 777777777777777')
+    }
+    assert.ok(!multiCalls.some(c => c[0] === 'track'), 'Cenário 4: Nenhum evento genérico track foi emitido')
+
+    // -------------------------------------------------------------------------
+    // CENÁRIO 5: Igualdade dos event_ids (PageView e InitiateCheckout: Navegador ↔ CAPI)
+    // -------------------------------------------------------------------------
+    const callsEq: any[] = []
+    const eqFbq = function(...args: any[]) { callsEq.push(args) }
+    const domEq = [
+      { tag: 'a', attrs: { href: 'https://pay.hotmart.com/checkout_parity' } }
+    ]
+    const env5 = createTestEnv({
+      initialFbq: eqFbq,
+      scriptAttrs: { 'data-pixel-id': '888888888888888' },
+      domElements: domEq
+    })
+    vm.runInContext(trackerCode, env5.context)
+
+    // Disparar clique para InitiateCheckout
+    const clickListeners5 = env5.eventListeners['click'] || []
+    for (const listener of clickListeners5) {
+      listener({ target: env5.elements[0] })
+    }
+
+    // 1. Verificar PageView
+    const fbqPv = callsEq.find(c => c[0] === 'trackSingle' && c[2] === 'PageView')
+    const beaconPv = env5.sentBeacons.find(b => b.url.includes('/api/tracking/event') && b.rawText?.includes('"PageView"'))
+    assert.ok(fbqPv && beaconPv, 'Cenário 5: PageView disparado no navegador e enviado ao backend')
+    const pvPayload = JSON.parse(beaconPv.rawText!)
+    assert.equal(fbqPv[4].eventID, pvPayload.eventId, 'Cenário 5: event_id de PageView coincide 100% entre navegador e servidor')
+
+    // 2. Verificar InitiateCheckout
+    const fbqIc = callsEq.find(c => c[0] === 'trackSingle' && c[2] === 'InitiateCheckout')
+    const beaconIc = env5.sentBeacons.find(b => b.url.includes('/api/tracking/event') && b.rawText?.includes('"InitiateCheckout"'))
+    assert.ok(fbqIc && beaconIc, 'Cenário 5: InitiateCheckout disparado no navegador e enviado ao backend')
+    const icPayload = JSON.parse(beaconIc.rawText!)
+    assert.equal(fbqIc[4].eventID, icPayload.eventId, 'Cenário 5: event_id de InitiateCheckout coincide 100% entre navegador e servidor')
+
+    // -------------------------------------------------------------------------
+    // CENÁRIO 6: Falha / Bloqueio no Carregamento do SDK (onerror / AdBlocker) -> Resiliência total
+    // -------------------------------------------------------------------------
+    const domResilient = [
+      { tag: 'a', attrs: { href: 'https://pay.kiwify.com.br/checkout_resilient' } }
+    ]
+    const env6 = createTestEnv({
+      simulateSdkFailure: true,
+      scriptAttrs: { 'data-pixel-id': '555555555555555' },
+      domElements: domResilient
+    })
+
+    assert.doesNotThrow(() => {
+      vm.runInContext(trackerCode, env6.context)
+    }, 'Cenário 6: Falha de carregamento do SDK fbevents.js não lança exceção')
+
+    assert.ok(
+      env6.sentBeacons.some(b => b.url.includes('/api/tracking/session')),
+      'Cenário 6: Sessão registrada com sucesso mesmo com SDK bloqueado'
+    )
+    assert.ok(
+      env6.sentBeacons.some(b => b.url.includes('/api/tracking/event') && b.rawText?.includes('"PageView"')),
+      'Cenário 6: PageView enviado à CAPI mesmo com SDK bloqueado no cliente'
+    )
+    assert.ok(
+      env6.elements[0].href.includes('_utmt_sid='),
+      'Cenário 6: Decoração de link de checkout concluída normalmente'
+    )
+    assert.ok(
+      env6.mockStorage['_utmt_campaign'],
+      'Cenário 6: UTMs salvas no localStorage com sucesso'
+    )
+
+    // -------------------------------------------------------------------------
+    // CENÁRIO 7: Flag data-auto-pixel="false" -> Não injeta SDK nem stub
+    // -------------------------------------------------------------------------
+    const env7 = createTestEnv({
+      scriptAttrs: {
+        'data-pixel-id': '444444444444444',
+        'data-auto-pixel': 'false'
+      }
+    })
+    vm.runInContext(trackerCode, env7.context)
+
+    assert.equal(env7.context.window.fbq, undefined, 'Cenário 7: fbq não é criado quando data-auto-pixel="false"')
+    assert.equal(env7.createdScripts.length, 0, 'Cenário 7: Nenhuma tag de script é injetada')
+    assert.ok(
+      env7.sentBeacons.some(b => b.url.includes('/api/tracking/session')),
+      'Cenário 7: Tracking próprio de sessão continua operacional'
+    )
   })
 })
