@@ -81,57 +81,7 @@ export async function dispatchPurchaseToCapi(params: DispatchPurchaseParams) {
 
     if (!workspaceId) return { sent: false, success: false, reason: 'missing_workspace_id' }
 
-    // 0. Resolver ou herdar eventId canônico e globalmente único
-    let eventId = directEventId
-    if (!eventId) {
-      // 0.1 Se o tracker.js já disparou o evento no navegador para esta venda/pedido, reutilizar o mesmo eventId
-      const existingEvt = await prisma.trackingEvent.findFirst({
-        where: {
-          workspaceId,
-          orderId: externalId || saleId,
-          eventName: 'Purchase'
-        },
-        orderBy: { createdAt: 'desc' }
-      })
-      if (existingEvt?.eventId) {
-        eventId = existingEvt.eventId
-      } else {
-        eventId = buildPurchaseEventId(workspaceId, externalId || saleId, platform)
-      }
-    }
-    resolvedEventId = eventId
-
-    // 0.2 Idempotência Estrita: Se já foi enviado com sucesso para a Meta CAPI anteriormente, NUNCA reenviar
-    const existingStatus = await prisma.trackingEvent.findUnique({
-      where: { eventId }
-    })
-
-    if (existingStatus?.status === 'sent') {
-      console.log(`[CAPI Service] Idempotência: Purchase ${eventId} já foi transmitido anteriormente para a Meta com sucesso em ${existingStatus.sentAt}. Reenvio duplicado ignorado.`)
-      return {
-        sent: false,
-        success: true,
-        skipped: true,
-        reason: 'already_sent',
-        eventId,
-        pixelId: existingStatus.pixelId || undefined
-      }
-    }
-
-    // 0.3 Trava de Concorrência: se a compra já está 'sending' há menos de 30s, evitar disparo duplo simultâneo
-    if (existingStatus?.status === 'sending' && existingStatus.updatedAt) {
-      const ageSeconds = (Date.now() - new Date(existingStatus.updatedAt).getTime()) / 1000
-      if (ageSeconds < 30) {
-        console.log(`[CAPI Service] Idempotência: Purchase ${eventId} já está sendo transmitido em outra requisição simultânea. Disparo concorrente ignorado.`)
-        return {
-          sent: false,
-          success: true,
-          skipped: true,
-          reason: 'in_flight',
-          eventId
-        }
-      }
-    }
+    const eventValue = (grossAmount !== null && grossAmount !== undefined) ? Number(grossAmount) : 0
 
     // 0. Pré-computar sessionData, userData e dados de matching para que QUALQUER falha preserve 100% dos dados
     let sessionData: { fbclid?: string | null; fbp?: string | null; fbc?: string | null; userAgent?: string | null; ipAddress?: string | null } | null = null
@@ -166,49 +116,134 @@ export async function dispatchPurchaseToCapi(params: DispatchPurchaseParams) {
       }
     }
 
-    const eventValue = (grossAmount !== null && grossAmount !== undefined) ? Number(grossAmount) : 0
+    // 0.1 Resolver ou herdar eventId canônico isolado estritamente por workspace e plataforma
+    const canonicalId = buildPurchaseEventId(workspaceId, externalId || saleId, platform)
+    let eventId = directEventId || canonicalId
 
-    // 0.4 Registrar que o evento está em processamento ('sending') antes de chamar a Meta (lock de concorrência)
-    await prisma.trackingEvent.upsert({
-      where: { eventId },
-      update: {
-        status: 'sending'
-      },
-      create: {
-        eventId,
+    // Buscar evento existente estritamente isolado por workspace, orderId e plataforma
+    const existingEvt = await prisma.trackingEvent.findFirst({
+      where: {
         workspaceId,
-        sessionId: sessionId || null,
-        eventName: 'Purchase',
-        eventTime: approvedAt || new Date(),
-        value: eventValue,
-        currency: currency || 'BRL',
         orderId: externalId || saleId,
+        eventName: 'Purchase',
+        OR: [
+          { eventId: canonicalId },
+          ...(platform ? [{ platform }] : []),
+          { eventId: { contains: `_${platform ? platform.toLowerCase() : ''}_` } }
+        ]
+      },
+      orderBy: { createdAt: 'desc' }
+    })
+    if (existingEvt?.eventId) {
+      eventId = existingEvt.eventId
+    }
+    resolvedEventId = eventId
+
+    // 0.2 Trava Atômica de Concorrência e Idempotência Estrita
+    const lockThreshold = new Date(Date.now() - 30 * 1000) // 30 segundos de lock
+
+    // Tentar adquirir trava condicionalmente em registro existente
+    const lockResult = await prisma.trackingEvent.updateMany({
+      where: {
+        eventId,
+        OR: [
+          { status: 'received' },
+          { status: 'failed' },
+          { status: 'sending', updatedAt: { lt: lockThreshold } }
+        ]
+      },
+      data: {
         status: 'sending',
-        retryCount: 0,
-        clientIp: effectiveIp || null,
-        clientUserAgent: effectiveUserAgent || null,
-        emailHash: userData.em?.[0] || null,
-        phoneHash: userData.ph?.[0] || null,
-        fbp: effectiveFbp || null,
-        fbc: effectiveFbc || null,
-        fbclid: sessionData?.fbclid || null
+        updatedAt: new Date()
       }
-    }).catch(err => console.error('[CAPI Service] Erro ao registrar status sending:', err))
+    })
+
+    if (lockResult.count === 0) {
+      const existingStatus = await prisma.trackingEvent.findUnique({
+        where: { eventId }
+      })
+
+      if (existingStatus) {
+        if (existingStatus.status === 'sent') {
+          console.log(`[CAPI Service] Idempotência: Purchase ${eventId} já foi transmitido anteriormente para a Meta com sucesso em ${existingStatus.sentAt}. Reenvio duplicado ignorado.`)
+          return {
+            sent: false,
+            success: true,
+            skipped: true,
+            reason: 'already_sent',
+            eventId,
+            pixelId: existingStatus.pixelId || undefined
+          }
+        }
+        if (existingStatus.status === 'sending') {
+          console.log(`[CAPI Service] Idempotência: Purchase ${eventId} já está sendo transmitido em outra requisição simultânea. Disparo concorrente ignorado.`)
+          return {
+            sent: false,
+            success: true,
+            skipped: true,
+            reason: 'in_flight',
+            eventId
+          }
+        }
+      } else {
+        // O registro ainda não existia: tentar criá-lo atomicamente com status 'sending'
+        try {
+          await prisma.trackingEvent.create({
+            data: {
+              eventId,
+              workspaceId,
+              orderId: externalId || saleId,
+              platform: platform || null,
+              eventName: 'Purchase',
+              eventTime: approvedAt || new Date(),
+              value: eventValue,
+              currency: currency || 'BRL',
+              status: 'sending',
+              sessionId: sessionId || null,
+              clientIp: effectiveIp || null,
+              clientUserAgent: effectiveUserAgent || null,
+              emailHash: userData.em?.[0] || null,
+              phoneHash: userData.ph?.[0] || null,
+              fbp: effectiveFbp || null,
+              fbc: effectiveFbc || null,
+              fbclid: sessionData?.fbclid || null
+            }
+          })
+        } catch (createErr: any) {
+          if (createErr?.code === 'P2002' || String(createErr).includes('unique constraint') || String(createErr).includes('Unique constraint')) {
+            const competitor = await prisma.trackingEvent.findUnique({ where: { eventId } })
+            if (competitor?.status === 'sent') {
+              return {
+                sent: false,
+                success: true,
+                skipped: true,
+                reason: 'already_sent',
+                eventId,
+                pixelId: competitor.pixelId || undefined
+              }
+            }
+            return {
+              sent: false,
+              success: true,
+              skipped: true,
+              reason: 'in_flight',
+              eventId
+            }
+          }
+          throw createErr
+        }
+      }
+    }
 
     const recordFailedPurchaseEvent = async (errorMsg: string, pixelDbId?: string | null) => {
       await prisma.trackingEvent.upsert({
         where: { eventId },
         update: {
           pixelId: pixelDbId || undefined,
+          platform: platform || null,
           status: 'failed',
           capiError: errorMsg,
-          clientIp: effectiveIp || null,
-          clientUserAgent: effectiveUserAgent || null,
-          emailHash: userData.em?.[0] || null,
-          phoneHash: userData.ph?.[0] || null,
-          fbp: effectiveFbp || null,
-          fbc: effectiveFbc || null,
-          fbclid: sessionData?.fbclid || null
+          updatedAt: new Date()
         },
         create: {
           eventId,
@@ -220,6 +255,7 @@ export async function dispatchPurchaseToCapi(params: DispatchPurchaseParams) {
           value: eventValue,
           currency: currency || 'BRL',
           orderId: externalId || saleId,
+          platform: platform || null,
           status: 'failed',
           capiError: errorMsg,
           retryCount: 0,
@@ -359,6 +395,7 @@ export async function dispatchPurchaseToCapi(params: DispatchPurchaseParams) {
       where: { eventId },
       update: {
         pixelId: pixel.id,
+        platform: platform || null,
         status: isSuccess ? 'sent' : 'failed',
         capiResponse: JSON.stringify(capiResult),
         capiError: isSuccess ? null : JSON.stringify(capiResult?.error || 'Nenhum evento aceito pela Meta'),
@@ -381,6 +418,7 @@ export async function dispatchPurchaseToCapi(params: DispatchPurchaseParams) {
         value: eventValue,
         currency: currency || 'BRL',
         orderId: externalId || saleId,
+        platform: platform || null,
         status: isSuccess ? 'sent' : 'failed',
         capiResponse: JSON.stringify(capiResult),
         capiError: isSuccess ? null : JSON.stringify(capiResult?.error || 'Nenhum evento aceito pela Meta'),
@@ -612,13 +650,17 @@ export async function dispatchNavigationToCapi(params: DispatchNavigationParams)
  */
 export async function retryFailedCapiEvents(workspaceId?: string, limit = 20) {
   try {
+    const staleThreshold = new Date(Date.now() - 5 * 60 * 1000) // 5 minutos preso em sending
     const whereClause: {
-      status: string
       retryCount: { lt: number }
       workspaceId?: string
+      OR: Array<{ status: string } | { status: string; updatedAt: { lt: Date } }>
     } = {
-      status: 'failed',
-      retryCount: { lt: 5 }
+      retryCount: { lt: 5 },
+      OR: [
+        { status: 'failed' },
+        { status: 'sending', updatedAt: { lt: staleThreshold } }
+      ]
     }
     if (workspaceId) whereClause.workspaceId = workspaceId
 
@@ -725,6 +767,7 @@ export async function retryFailedCapiEvents(workspaceId?: string, limit = 20) {
           where: { id: evt.id },
           data: {
             pixelId: pixel.id,
+            status: 'failed',
             retryCount: { increment: 1 },
             capiResponse: JSON.stringify(capiResult),
             capiError: JSON.stringify(capiResult?.error || 'Retry falhou')

@@ -1,6 +1,6 @@
 import { NextResponse } from 'next/server'
 import { prisma } from '@/lib/db'
-import { dispatchNavigationToCapi } from '@/lib/meta/capi-service'
+import { dispatchNavigationToCapi, buildPurchaseEventId } from '@/lib/meta/capi-service'
 
 export async function POST(req: Request) {
   try {
@@ -18,6 +18,7 @@ export async function POST(req: Request) {
       sourceUrl
     } = body
 
+    const platform = body.platform ? String(body.platform).toLowerCase().trim() : undefined
     const pixelId = body.pixelId || searchParams.get('pixelId') || searchParams.get('pixel_id') || undefined
 
     if (!eventId || !workspaceId || !eventName) {
@@ -55,19 +56,27 @@ export async function POST(req: Request) {
       // Better yet, just insert the event if sessionId is missing from DB, as it might be delayed.
     }
 
-    // 1. Para Purchase, verificar se já existe evento gravado para este pedido neste workspace
+    // 1. Para Purchase, verificar se já existe evento gravado para este pedido neste workspace e plataforma
     let finalEventId = eventId
     if (eventName === 'Purchase' && orderId) {
+      const canonicalId = buildPurchaseEventId(workspace.id, String(orderId), platform)
       const existingPurchase = await prisma.trackingEvent.findFirst({
         where: {
           workspaceId: workspace.id,
           orderId: String(orderId),
-          eventName: 'Purchase'
+          eventName: 'Purchase',
+          OR: [
+            { eventId: canonicalId },
+            ...(platform ? [{ platform }] : []),
+            { eventId: { contains: `_${platform ? platform.toLowerCase() : ''}_` } }
+          ]
         },
         orderBy: { createdAt: 'desc' }
       })
       if (existingPurchase?.eventId) {
         finalEventId = existingPurchase.eventId
+      } else if (!finalEventId || finalEventId.startsWith('evt_')) {
+        finalEventId = canonicalId
       }
     }
 
@@ -93,6 +102,7 @@ export async function POST(req: Request) {
           value: numericValue,
           currency,
           orderId,
+          platform: platform || undefined,
           contentIds: contentIds ? (typeof contentIds === 'string' ? contentIds : JSON.stringify(contentIds)) : null,
           sourceUrl,
           status: 'received',
@@ -110,6 +120,7 @@ export async function POST(req: Request) {
         where: { id: existing.id },
         data: {
           sessionId: sessionId || existing.sessionId,
+          platform: existing.platform || platform || undefined,
           clientIp: existing.clientIp || effectiveIp,
           clientUserAgent: existing.clientUserAgent || effectiveUserAgent,
           fbp: existing.fbp || session?.fbp || null,

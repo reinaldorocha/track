@@ -1,5 +1,8 @@
 import { describe, it, before, after } from 'node:test'
 import assert from 'node:assert/strict'
+import fs from 'node:fs'
+import path from 'node:path'
+import vm from 'node:vm'
 
 process.env.ENCRYPTION_KEY = process.env.ENCRYPTION_KEY || '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
 
@@ -686,6 +689,278 @@ describe('Automação CAPI, Decoração Real de Checkout, Roteamento por Produto
         where: { eventId: { in: [eventIdWs1Hotmart, eventIdWs1Kiwify, eventIdWs2Hotmart] } }
       })
       await prisma.workspace.delete({ where: { id: ws2.id } })
+    }
+  })
+
+  // 16. Execução real do tracker.js no Node.js via vm: zero ReferenceError, detecção correta e paridade de eventId
+  it('16. Execução real do tracker.js: zero ReferenceError (script vs currentScript), detecção de plataforma e paridade determinística CAPI', () => {
+    const trackerPath = path.join(__dirname, '..', 'public', 'tracker.js')
+    const trackerCode = fs.readFileSync(trackerPath, 'utf8')
+
+    // Mock do ambiente DOM
+    const mockStorage: Record<string, string> = {}
+    const mockSessionStorage: Record<string, string> = {}
+    const sentRequests: Array<{ url: string; data: any }> = []
+    const fbqCalls: Array<{ eventName: string; params: any; options: any }> = []
+
+    const mockScriptEl = {
+      getAttribute: (name: string) => {
+        if (name === 'data-api-url') return 'https://track.app.test'
+        if (name === 'data-workspace-id') return testWorkspaceId
+        if (name === 'data-platform') return 'kiwify'
+        if (name === 'data-pixel-id') return testPixelA.id
+        return null
+      }
+    }
+
+    const addEventListener = () => {}
+    const context = {
+      window: {} as any,
+      addEventListener,
+      removeEventListener: () => {},
+      document: {
+        currentScript: mockScriptEl,
+        getElementsByTagName: (tag: string) => tag === 'script' ? [mockScriptEl] : [],
+        querySelectorAll: () => [],
+        querySelector: () => null,
+        addEventListener,
+        removeEventListener: () => {},
+        cookie: '',
+        referrer: 'https://pay.kiwify.com.br/checkout'
+      } as any,
+      location: {
+        href: 'https://minhaloja.com.br/obrigado?order_id=kw_123456&value=297&currency=BRL',
+        pathname: '/obrigado',
+        search: '?order_id=kw_123456&value=297&currency=BRL'
+      } as any,
+      navigator: {
+        userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+        sendBeacon: (url: string, data: any) => {
+          sentRequests.push({ url, data })
+          return true
+        }
+      } as any,
+      sessionStorage: {
+        getItem: (k: string) => mockSessionStorage[k] || null,
+        setItem: (k: string, v: string) => { mockSessionStorage[k] = String(v) }
+      },
+      localStorage: {
+        getItem: (k: string) => mockStorage[k] || null,
+        setItem: (k: string, v: string) => { mockStorage[k] = String(v) }
+      },
+      Date: Date,
+      Math: Math,
+      URL: URL,
+      RegExp: RegExp,
+      parseFloat: parseFloat,
+      parseInt: parseInt,
+      Number: Number,
+      String: String,
+      JSON: JSON,
+      console: console,
+      Blob: globalThis.Blob
+    }
+    context.window = context
+
+    // Injetar fbq mock
+    context.window.fbq = (action: string, eventName: string, params: any, options: any) => {
+      fbqCalls.push({ eventName, params, options })
+    }
+
+    // Executar o script real na vm
+    vm.createContext(context)
+    assert.doesNotThrow(() => {
+      vm.runInContext(trackerCode, context)
+    }, 'O script tracker.js real DEVE executar sem ReferenceError ou exceções de runtime')
+
+    // Verificar que window.utmTrack foi criado
+    assert.ok(context.window.utmTrack, 'window.utmTrack deve estar disponível')
+
+    // Testar detectPlatform
+    const detected = context.window.utmTrack.detectPlatform('kw_123456')
+    assert.equal(detected, 'kiwify', 'detectPlatform deve detectar kiwify a partir de atributos ou padrão')
+
+    // Testar paridade determinística de buildPurchaseEventId com o servidor
+    const browserEventId = context.window.utmTrack.buildPurchaseEventId(testWorkspaceId, 'kw_123456', detected)
+    const serverEventId = buildPurchaseEventId(testWorkspaceId, 'kw_123456', 'kiwify')
+    assert.equal(browserEventId, serverEventId, 'O event_id gerado pelo navegador DEVE ser 100% idêntico ao do servidor')
+
+    // Testar chamada do trackPurchase manual
+    const trackedId = context.window.utmTrack.trackPurchase({
+      orderId: 'ORD_MANUAL_777',
+      platform: 'hotmart',
+      value: 497
+    })
+    const expectedServerId = buildPurchaseEventId(testWorkspaceId, 'ORD_MANUAL_777', 'hotmart')
+    assert.equal(trackedId, expectedServerId, 'trackPurchase manual deve produzir identidade determinística idêntica ao servidor')
+  })
+
+  // 17. Isolamento de Gateways: dois pedidos com mesmo orderId em plataformas distintas são ambos enviados sem confusão
+  it('17. Isolamento de Gateways: pedidos com mesmo orderId em plataformas distintas transmitem independentemente sem colisões', async () => {
+    const metaCalls: Array<any> = []
+    const originalFetch = global.fetch
+    global.fetch = async (_url: any, opts: any) => {
+      metaCalls.push(JSON.parse(opts.body))
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ events_received: 1 })
+      } as any
+    }
+
+    const collisionOrderId = `COLLISION_${Date.now()}`
+
+    try {
+      // 1ª Venda: Hotmart para o pedido
+      const resHotmart = await dispatchPurchaseToCapi({
+        workspaceId: testWorkspaceId,
+        saleId: `sale_hotmart_${collisionOrderId}`,
+        externalId: collisionOrderId,
+        platform: 'hotmart',
+        grossAmount: 497,
+        productId: testProductA.id,
+        customerEmail: 'cliente.hotmart@teste.com'
+      })
+
+      assert.equal(resHotmart.sent, true)
+      assert.equal(resHotmart.success, true)
+      assert.ok(resHotmart.eventId?.includes('hotmart'), 'eventId deve conter hotmart')
+
+      // 2ª Venda: Kiwify para o MESMO orderId no mesmo workspace
+      const resKiwify = await dispatchPurchaseToCapi({
+        workspaceId: testWorkspaceId,
+        saleId: `sale_kiwify_${collisionOrderId}`,
+        externalId: collisionOrderId,
+        platform: 'kiwify',
+        grossAmount: 1997,
+        productId: testProductB.id,
+        customerEmail: 'cliente.kiwify@teste.com'
+      })
+
+      // O pedido da Kiwify NÃO pode ser confundido com o da Hotmart e NÃO pode ser skipped como already_sent!
+      assert.equal(resKiwify.sent, true, 'Kiwify com mesmo orderId DEVE ser enviado e não herdado da Hotmart')
+      assert.equal(resKiwify.success, true)
+      assert.notEqual(resKiwify.skipped, true, 'Não pode ser skipped por confusão de gateways')
+      assert.ok(resKiwify.eventId?.includes('kiwify'), 'eventId deve conter kiwify')
+
+      assert.equal(metaCalls.length, 2, 'Meta deve ter recebido 2 chamadas independentes, uma para cada gateway')
+    } finally {
+      global.fetch = originalFetch
+      await prisma.trackingEvent.deleteMany({
+        where: { orderId: collisionOrderId, workspaceId: testWorkspaceId }
+      })
+    }
+  })
+
+  // 18. Trava Atômica de Concorrência: duas chamadas simultâneas não geram envio duplicado para a Meta
+  it('18. Trava Atômica de Concorrência: requisições simultâneas para a mesma compra disputam trava e apenas uma chama a Meta', async () => {
+    let metaCallsCount = 0
+    const originalFetch = global.fetch
+    global.fetch = async () => {
+      metaCallsCount++
+      // Delay intencional para manter a janela de concorrência aberta
+      await new Promise(res => setTimeout(res, 25))
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ events_received: 1 })
+      } as any
+    }
+
+    const concurrentOrderId = `CONCURRENT_${Date.now()}`
+
+    try {
+      const [call1, call2] = await Promise.all([
+        dispatchPurchaseToCapi({
+          workspaceId: testWorkspaceId,
+          saleId: `sale_c1_${concurrentOrderId}`,
+          externalId: concurrentOrderId,
+          platform: 'kiwify',
+          grossAmount: 497,
+          productId: testProductA.id,
+          customerEmail: 'concorrente@teste.com'
+        }),
+        dispatchPurchaseToCapi({
+          workspaceId: testWorkspaceId,
+          saleId: `sale_c2_${concurrentOrderId}`,
+          externalId: concurrentOrderId,
+          platform: 'kiwify',
+          grossAmount: 497,
+          productId: testProductA.id,
+          customerEmail: 'concorrente@teste.com'
+        })
+      ])
+
+      // Exatamente UMA chamada deve ter enviado para a Meta API
+      assert.equal(metaCallsCount, 1, 'Exatamente UMA requisição deve ter chamado a Meta Graph API')
+
+      const winners = [call1, call2].filter(c => c.sent === true && c.success === true)
+      const skipped = [call1, call2].filter(c => c.skipped === true && (c.reason === 'in_flight' || c.reason === 'already_sent'))
+
+      assert.equal(winners.length, 1, 'Exatamente um runner adquire a trava e conclui o envio')
+      assert.equal(skipped.length, 1, 'O segundo runner concorrente deve ser dispensado com in_flight ou already_sent')
+    } finally {
+      global.fetch = originalFetch
+      await prisma.trackingEvent.deleteMany({
+        where: { orderId: concurrentOrderId, workspaceId: testWorkspaceId }
+      })
+    }
+  })
+
+  // 19. Recuperação de eventos presos em 'sending' há mais de 5 minutos pela fila de retry
+  it('19. Fila de Retry: recupera eventos presos em status sending por execução interrompida ou timeout', async () => {
+    let retryMetaCalls = 0
+    const originalFetch = global.fetch
+    global.fetch = async () => {
+      retryMetaCalls++
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({ events_received: 1 })
+      } as any
+    }
+
+    const stuckOrderId = `STUCK_${Date.now()}`
+    const stuckEventId = buildPurchaseEventId(testWorkspaceId, stuckOrderId, 'hotmart')
+
+    try {
+      // Criar evento simulando trava presa em 'sending' há 10 minutos (execução serverless interrompida)
+      const tenMinutesAgo = new Date(Date.now() - 10 * 60 * 1000)
+      await prisma.trackingEvent.create({
+        data: {
+          eventId: stuckEventId,
+          workspaceId: testWorkspaceId,
+          pixelId: testPixelA.id,
+          eventName: 'Purchase',
+          eventTime: tenMinutesAgo,
+          orderId: stuckOrderId,
+          platform: 'hotmart',
+          value: 497,
+          status: 'sending',
+          updatedAt: tenMinutesAgo,
+          clientIp: '189.10.20.30',
+          clientUserAgent: 'Mozilla/5.0 Stuck Browser',
+          emailHash: sha256Hash('recuperado@teste.com')
+        }
+      })
+
+      // Executar a fila de retry
+      const retryResult = await retryFailedCapiEvents(testWorkspaceId)
+
+      assert.ok(retryResult.retried >= 1, 'O evento preso em sending deve ser capturado pela fila de retry')
+      assert.ok(retryResult.succeeded >= 1, 'O evento deve ser transmitido com sucesso à Meta')
+      assert.ok(retryMetaCalls >= 1, 'Meta deve ter sido chamada pelo retry')
+
+      // Verificar que o status no banco mudou para 'sent'
+      const updatedEvt = await prisma.trackingEvent.findUnique({
+        where: { eventId: stuckEventId }
+      })
+      assert.equal(updatedEvt?.status, 'sent', 'Status do evento deve ser atualizado para sent após retry bem-sucedido')
+    } finally {
+      global.fetch = originalFetch
+      await prisma.trackingEvent.deleteMany({
+        where: { eventId: stuckEventId }
+      })
     }
   })
 })

@@ -7,9 +7,10 @@
   }
 
   // Obter configurações a partir dos atributos da tag script, meta tags ou variáveis globais
-  var script = document.currentScript || (function() {
+  var script = (typeof document !== 'undefined' && document.currentScript) || (function() {
+    if (typeof document === 'undefined' || !document.getElementsByTagName) return null;
     var scripts = document.getElementsByTagName('script');
-    return scripts[scripts.length - 1];
+    return scripts && scripts.length > 0 ? scripts[scripts.length - 1] : null;
   })();
 
   var metaPixelTag = typeof document !== 'undefined' && document.querySelector ? document.querySelector('meta[name="utmtrack-pixel"], meta[name="meta-pixel-id"]') : null;
@@ -99,10 +100,10 @@
   function send(endpoint, data) {
     var url = config.apiUrl + endpoint;
     var body = JSON.stringify(data);
-    if (navigator.sendBeacon) {
+    if (typeof navigator !== 'undefined' && navigator.sendBeacon && typeof Blob !== 'undefined') {
       var blob = new Blob([body], {type:'application/json'});
       navigator.sendBeacon(url, blob);
-    } else {
+    } else if (typeof fetch === 'function') {
       fetch(url, {method:'POST',body:body,headers:{'Content-Type':'application/json'},keepalive:true}).catch(function(){});
     }
   }
@@ -162,6 +163,20 @@
     return false;
   }
 
+  function detectCheckoutPlatform(urlStr) {
+    if (!urlStr) return '';
+    var lower = urlStr.toLowerCase();
+    if (lower.indexOf('hotmart') !== -1) return 'hotmart';
+    if (lower.indexOf('kiwify') !== -1) return 'kiwify';
+    if (lower.indexOf('cakto') !== -1 || lower.indexOf('cacto') !== -1) return 'cakto';
+    if (lower.indexOf('yampi') !== -1) return 'yampi';
+    if (lower.indexOf('getfy') !== -1) return 'getfy';
+    if (lower.indexOf('shopify') !== -1 || lower.indexOf('myshopify') !== -1) return 'shopify';
+    if (lower.indexOf('eduzz') !== -1) return 'eduzz';
+    if (lower.indexOf('braip') !== -1) return 'braip';
+    return '';
+  }
+
   // Decora uma URL de checkout anexando UTMs, src, sck, fbclid e sessionIds
   function decorateUrl(urlStr) {
     if (!urlStr || urlStr.indexOf('javascript:') === 0 || urlStr.indexOf('#') === 0) return urlStr;
@@ -190,6 +205,15 @@
       // Identificador de Sessão do UTM-Track para correlação direta
       if (sessionId && !parsed.searchParams.has('_utmt_sid')) parsed.searchParams.set('_utmt_sid', sessionId);
       if (visitorId && !parsed.searchParams.has('_utmt_vid')) parsed.searchParams.set('_utmt_vid', visitorId);
+
+      // Persistir plataforma de checkout detectada para deduplicação no obrigado
+      var detectedCheckoutPlat = detectCheckoutPlatform(urlStr);
+      if (detectedCheckoutPlat) {
+        try {
+          if (typeof sessionStorage !== 'undefined') sessionStorage.setItem('_utmt_platform', detectedCheckoutPlat);
+          setCookie('_utmt_plat', detectedCheckoutPlat, 7);
+        } catch(e) {}
+      }
 
       return parsed.toString();
     } catch(e) {
@@ -318,12 +342,17 @@
     var p = getParam('platform') || getParam('gateway') || getParam('origem') || getParam('provider');
     if (p) return p.toLowerCase().trim();
 
-    if (currentScript) {
-      var dp = currentScript.getAttribute('data-platform') || currentScript.getAttribute('data-gateway');
+    if (script && script.getAttribute) {
+      var dp = script.getAttribute('data-platform') || script.getAttribute('data-gateway');
       if (dp) return dp.toLowerCase().trim();
     }
 
-    var ref = (document.referrer || '').toLowerCase();
+    try {
+      var storedPlat = (typeof sessionStorage !== 'undefined' && sessionStorage.getItem('_utmt_platform')) || getCookie('_utmt_plat');
+      if (storedPlat) return storedPlat.toLowerCase().trim();
+    } catch(e) {}
+
+    var ref = (typeof document !== 'undefined' && document.referrer ? document.referrer : '').toLowerCase();
     if (ref.indexOf('hotmart') !== -1) return 'hotmart';
     if (ref.indexOf('kiwify') !== -1) return 'kiwify';
     if (ref.indexOf('cakto') !== -1 || ref.indexOf('cacto') !== -1) return 'cakto';
@@ -336,6 +365,9 @@
     if (getParam('hottok') || (orderId && String(orderId).toUpperCase().indexOf('HP') === 0)) return 'hotmart';
     if (getParam('kiwify') || (orderId && String(orderId).indexOf('kw_') === 0)) return 'kiwify';
     if (getParam('cakto') || (orderId && String(orderId).indexOf('ck_') === 0)) return 'cakto';
+    if (getParam('yampi')) return 'yampi';
+    if (getParam('getfy')) return 'getfy';
+    if (getParam('shopify')) return 'shopify';
 
     return '';
   }
@@ -386,6 +418,7 @@
             eventName: 'Purchase',
             eventId: purchaseEventId,
             orderId: orderId,
+            platform: platform || undefined,
             value: val,
             currency: curr,
             sourceUrl: location.href
@@ -435,6 +468,7 @@
         eventName: 'Purchase',
         eventId: purchaseEventId,
         orderId: orderId || undefined,
+        platform: platform || undefined,
         value: val,
         currency: curr,
         sourceUrl: location.href

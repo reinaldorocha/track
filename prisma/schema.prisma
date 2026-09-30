@@ -368,6 +368,7 @@ model TrackingEvent {
   value           Float?
   currency        String?
   orderId         String?
+  platform        String?
   contentIds      String?  // JSON array
   contentType     String?
   // User data (hashed when sent to Meta)
