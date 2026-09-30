@@ -15,7 +15,12 @@
 
   var metaPixelTag = typeof document !== 'undefined' && document.querySelector ? document.querySelector('meta[name="utmtrack-pixel"], meta[name="meta-pixel-id"]') : null;
   var platformTag = typeof document !== 'undefined' && document.querySelector ? document.querySelector('meta[name="utmtrack-platform"], meta[name="platform"], meta[name="gateway"]') : null;
+  var metaTtlTag = typeof document !== 'undefined' && document.querySelector ? document.querySelector('meta[name="utmtrack-campaign-ttl"], meta[name="campaign-ttl-days"], meta[name="utm-ttl-days"]') : null;
   
+  var campaignTtlAttr = script && (script.getAttribute('data-campaign-ttl-days') || script.getAttribute('data-campaign-ttl') || script.getAttribute('data-ttl-days'));
+  var ttlParsed = parseInt(campaignTtlAttr || (metaTtlTag && metaTtlTag.getAttribute('content')) || (typeof window !== 'undefined' && (window.UTM_TRACK_CAMPAIGN_TTL_DAYS || window.UTM_CAMPAIGN_TTL_DAYS)) || '30', 10);
+  var campaignTtlDays = (!isNaN(ttlParsed) && ttlParsed > 0) ? ttlParsed : 30;
+
   var config = {
     apiUrl: (script && script.getAttribute('data-api-url')) || '',
     workspaceId: (script && script.getAttribute('data-workspace-id')) || '',
@@ -28,7 +33,8 @@
     platform: (script && (script.getAttribute('data-platform') || script.getAttribute('data-gateway'))) ||
               (platformTag && platformTag.getAttribute('content')) ||
               (typeof window !== 'undefined' && (window.UTM_TRACK_PLATFORM || window.UTM_PLATFORM)) ||
-              ''
+              '',
+    campaignTtlDays: campaignTtlDays
   };
   
   if (!config.apiUrl || !config.workspaceId) return;
@@ -66,7 +72,7 @@
   }
   
   // 1. Extração de Parâmetros UTM e Identificadores Meta Ads
-  var utms = {
+  var rawUtms = {
     source: getParam('utm_source') || getParam('src'),
     medium: getParam('utm_medium'),
     campaign: getParam('utm_campaign') || getParam('sck'),
@@ -75,31 +81,136 @@
   };
   
   var fbclid = getParam('fbclid');
+  var gclid = getParam('gclid');
+
+  // Inferência automática de origem para tráfego pago se UTMs não vierem preenchidas
+  if (!rawUtms.source && fbclid) {
+    rawUtms.source = 'facebook';
+    rawUtms.medium = rawUtms.medium || 'cpc';
+  } else if (!rawUtms.source && gclid) {
+    rawUtms.source = 'google';
+    rawUtms.medium = rawUtms.medium || 'cpc';
+  }
+
+  // Verifica se a URL atual contém uma nova campanha
+  var hasCampaignInUrl = Boolean(
+    rawUtms.source ||
+    rawUtms.campaign ||
+    rawUtms.medium ||
+    rawUtms.content ||
+    rawUtms.term
+  );
+
   var fbp = getCookie('_fbp') || ('fb.1.' + Date.now() + '.' + Math.floor(Math.random()*1e9));
   var fbc = fbclid ? ('fb.1.' + Date.now() + '.' + fbclid) : getCookie('_fbc');
   
   // Persistir cookies first-party por 90 dias
   if (!getCookie('_fbp')) setCookie('_fbp', fbp, 90);
-  if (fbc && !getCookie('_fbc')) setCookie('_fbc', fbc, 90);
+  if (fbclid) {
+    setCookie('_fbc', fbc, 90);
+  } else if (fbc && !getCookie('_fbc')) {
+    setCookie('_fbc', fbc, 90);
+  }
   
   var sessionId = getOrCreateId('_utmt_sid', false); // 30min session
   var visitorId = getOrCreateId('_utmt_vid', true);  // persistent localStorage
   
-  // Persistir UTMs na navegação do site (sessionStorage)
-  if (utms.campaign || utms.source) {
-    try { sessionStorage.setItem('_utmt_utm', JSON.stringify(utms)); } catch(e) {}
-  } else {
-    try { 
-      var stored = sessionStorage.getItem('_utmt_utm');
-      if (stored) {
-        var parsed = JSON.parse(stored);
-        utms.source = utms.source || parsed.source;
-        utms.medium = utms.medium || parsed.medium;
-        utms.campaign = utms.campaign || parsed.campaign;
-        utms.content = utms.content || parsed.content;
-        utms.term = utms.term || parsed.term;
+  var STORAGE_KEY_CAMPAIGN = '_utmt_campaign';
+  var STORAGE_KEY_SESSION_UTM = '_utmt_utm';
+
+  var utms = {
+    source: null,
+    medium: null,
+    campaign: null,
+    content: null,
+    term: null
+  };
+
+  if (hasCampaignInUrl) {
+    // Nova campanha na URL: substituição ATÔMICA integral (evita contaminação de campos entre campanhas)
+    utms = {
+      source: rawUtms.source || null,
+      medium: rawUtms.medium || null,
+      campaign: rawUtms.campaign || null,
+      content: rawUtms.content || null,
+      term: rawUtms.term || null
+    };
+
+    try {
+      if (typeof localStorage !== 'undefined') {
+        var campaignPayload = {
+          utms: utms,
+          timestamp: Date.now(),
+          ttlDays: campaignTtlDays
+        };
+        localStorage.setItem(STORAGE_KEY_CAMPAIGN, JSON.stringify(campaignPayload));
       }
     } catch(e) {}
+
+    try {
+      if (typeof sessionStorage !== 'undefined') {
+        sessionStorage.setItem(STORAGE_KEY_SESSION_UTM, JSON.stringify(utms));
+      }
+    } catch(e) {}
+  } else {
+    // Sem campanha na URL: recuperação da campanha anterior armazenada (Last-Click não-direto)
+    var recovered = false;
+    try {
+      if (typeof localStorage !== 'undefined') {
+        var storedCampaign = localStorage.getItem(STORAGE_KEY_CAMPAIGN);
+        if (storedCampaign) {
+          var parsed = JSON.parse(storedCampaign);
+          if (parsed && parsed.timestamp && parsed.utms) {
+            var ttlMs = (parsed.ttlDays || campaignTtlDays) * 24 * 60 * 60 * 1000;
+            if (Date.now() - parsed.timestamp <= ttlMs) {
+              // Campanha válida e dentro do período de expiração
+              utms = {
+                source: parsed.utms.source || null,
+                medium: parsed.utms.medium || null,
+                campaign: parsed.utms.campaign || null,
+                content: parsed.utms.content || null,
+                term: parsed.utms.term || null
+              };
+              recovered = true;
+              try {
+                if (typeof sessionStorage !== 'undefined') {
+                  sessionStorage.setItem(STORAGE_KEY_SESSION_UTM, JSON.stringify(utms));
+                }
+              } catch(e) {}
+            } else {
+              // Campanha expirada (> 30 dias): descarte imediato
+              localStorage.removeItem(STORAGE_KEY_CAMPAIGN);
+              try {
+                if (typeof sessionStorage !== 'undefined') {
+                  sessionStorage.removeItem(STORAGE_KEY_SESSION_UTM);
+                }
+              } catch(e) {}
+            }
+          }
+        }
+      }
+    } catch(e) {}
+
+    // Fallback gracioso para sessionStorage se localStorage indisponível ou vazio
+    if (!recovered) {
+      try {
+        if (typeof sessionStorage !== 'undefined') {
+          var sessionStored = sessionStorage.getItem(STORAGE_KEY_SESSION_UTM);
+          if (sessionStored) {
+            var sParsed = JSON.parse(sessionStored);
+            if (sParsed) {
+              utms = {
+                source: sParsed.source || null,
+                medium: sParsed.medium || null,
+                campaign: sParsed.campaign || null,
+                content: sParsed.content || null,
+                term: sParsed.term || null
+              };
+            }
+          }
+        }
+      } catch(e) {}
+    }
   }
   
   function send(endpoint, data) {
@@ -497,6 +608,8 @@
     decorateUrl: decorateUrl,
     sessionId: sessionId,
     visitorId: visitorId,
-    pixelId: config.pixelId
+    pixelId: config.pixelId,
+    utms: utms,
+    campaignTtlDays: campaignTtlDays
   };
 })();

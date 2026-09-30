@@ -11,8 +11,10 @@ import {
   normalizeSaleAmount,
   normalizeNetAmount,
   normalizeSaleStatus,
-  normalizeSaleUtms
+  normalizeSaleUtms,
+  upsertSale
 } from '../src/lib/integrations/normalizer'
+import { attemptAttribution } from '../src/lib/tracking/attribution'
 import { dispatchPurchaseToCapi, dispatchNavigationToCapi, retryFailedCapiEvents, buildPurchaseEventId } from '../src/lib/meta/capi-service'
 import { sendPixelEvents } from '../src/lib/meta/pixel'
 import { decorateCheckoutUrl, isCheckoutUrl } from '../src/lib/tracking/checkout-decorator'
@@ -1827,6 +1829,396 @@ describe('Automação CAPI, Decoração Real de Checkout, Roteamento por Produto
         await prisma.pixel.deleteMany({ where: { workspaceId: isoWsId } })
         await prisma.workspace.delete({ where: { id: isoWsId } }).catch(() => {})
       }
+    }
+  })
+
+  // 27. Persistência de UTMs entre visitas no tracker.js (Last-Click de Campanha)
+  it('27. Persistência de UTMs entre visitas no tracker.js (Last-Click de Campanha): A -> Retorno Direto -> Compra; A -> B -> Compra; Expiração de TTL; Substituição Atômica e Resiliência de Storage', async () => {
+    const trackerPath = path.join(__dirname, '..', 'public', 'tracker.js')
+    const trackerCode = fs.readFileSync(trackerPath, 'utf8')
+
+    function runTrackerInVm(options: {
+      url: string
+      referrer?: string
+      cookies?: string
+      localStorageData?: Record<string, string>
+      sessionStorageData?: Record<string, string>
+      scriptAttrs?: Record<string, string>
+      throwOnLocalStorageSet?: boolean
+      domElements?: Array<{ tag: string; attrs: Record<string, string | undefined> }>
+    }) {
+      const mockStorage = { ...(options.localStorageData || {}) }
+      const mockSession = { ...(options.sessionStorageData || {}) }
+      const sentBeacons: Array<{ url: string; data: any }> = []
+      const sentFetches: Array<{ url: string; data: any }> = []
+
+      const scriptAttrs: Record<string, string> = {
+        'data-api-url': 'https://track.test',
+        'data-workspace-id': testWorkspaceId,
+        'data-pixel-id': testPixelA.id,
+        ...(options.scriptAttrs || {})
+      }
+
+      const mockScript = {
+        getAttribute: (attr: string) => scriptAttrs[attr] || null
+      }
+
+      const elements = (options.domElements || []).map(el => {
+        let hrefVal = el.attrs['href'] || ''
+        let actionVal = el.attrs['action'] || ''
+        let srcVal = el.attrs['src'] || ''
+        const item: any = {
+          tagName: el.tag.toUpperCase(),
+          getAttribute: (name: string) => {
+            if (name === 'href') return hrefVal
+            if (name === 'action') return actionVal
+            if (name === 'src') return srcVal
+            return el.attrs[name] || null
+          },
+          setAttribute: (name: string, val: string) => {
+            if (name === 'href') hrefVal = val
+            if (name === 'action') actionVal = val
+            if (name === 'src') srcVal = val
+            el.attrs[name] = val
+          },
+          get href() { return hrefVal },
+          set href(val: string) { hrefVal = val; el.attrs['href'] = val },
+          get action() { return actionVal },
+          set action(val: string) { actionVal = val; el.attrs['action'] = val },
+          get src() { return srcVal },
+          set src(val: string) { srcVal = val; el.attrs['src'] = val }
+        }
+        return item
+      })
+
+      const parsedUrl = new URL(options.url)
+      let cookieJar = options.cookies || ''
+
+      const context: any = {
+        window: {} as any,
+        addEventListener: () => {},
+        removeEventListener: () => {},
+        document: {
+          currentScript: mockScript,
+          getElementsByTagName: (tag: string) => tag === 'script' ? [mockScript] : [],
+          querySelectorAll: (sel: string) => {
+            if (sel.includes('a[href]')) return elements.filter(e => e.tagName === 'A')
+            if (sel.includes('form[action]')) return elements.filter(e => e.tagName === 'FORM')
+            if (sel.includes('iframe[src]')) return elements.filter(e => e.tagName === 'IFRAME')
+            return []
+          },
+          querySelector: () => null,
+          addEventListener: () => {},
+          removeEventListener: () => {},
+          get cookie() { return cookieJar },
+          set cookie(val: string) {
+            const parts = val.split(';')
+            const [kv] = parts
+            if (kv) {
+              const [k, v] = kv.split('=')
+              cookieJar = `${k.trim()}=${v.trim()}; ${cookieJar}`
+            }
+          },
+          referrer: options.referrer || ''
+        },
+        location: {
+          href: parsedUrl.href,
+          pathname: parsedUrl.pathname,
+          search: parsedUrl.search
+        },
+        navigator: {
+          userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+          sendBeacon: (url: string, data: any) => {
+            sentBeacons.push({ url, data })
+            return true
+          }
+        },
+        sessionStorage: {
+          getItem: (k: string) => mockSession[k] || null,
+          setItem: (k: string, v: string) => { mockSession[k] = String(v) },
+          removeItem: (k: string) => { delete mockSession[k] }
+        },
+        localStorage: {
+          getItem: (k: string) => mockStorage[k] || null,
+          setItem: (k: string, v: string) => {
+            if (options.throwOnLocalStorageSet) {
+              const err = new Error('QuotaExceededError')
+              err.name = 'QuotaExceededError'
+              throw err
+            }
+            mockStorage[k] = String(v)
+          },
+          removeItem: (k: string) => { delete mockStorage[k] }
+        },
+        Date: Date,
+        Math: Math,
+        URL: URL,
+        RegExp: RegExp,
+        parseFloat: parseFloat,
+        parseInt: parseInt,
+        Number: Number,
+        String: String,
+        JSON: JSON,
+        console: console,
+        Blob: globalThis.Blob,
+        fetch: async (url: string, opts: any) => {
+          sentFetches.push({ url, data: opts?.body })
+          return { ok: true, json: async () => ({ success: true }) }
+        }
+      }
+      context.window = context
+
+      vm.createContext(context)
+      vm.runInContext(trackerCode, context)
+
+      return {
+        context,
+        utmTrack: context.window.utmTrack,
+        mockStorage,
+        mockSession,
+        elements,
+        sentBeacons,
+        sentFetches,
+        cookieJar
+      }
+    }
+
+    try {
+      // -------------------------------------------------------------------------
+      // CENÁRIO 1: A -> Retorno Direto -> Compra
+      // -------------------------------------------------------------------------
+      const dom1 = [
+        { tag: 'a', attrs: { href: 'https://pay.kiwify.com.br/checkout_a1' } },
+        { tag: 'form', attrs: { action: 'https://pay.hotmart.com/checkout_a2' } },
+        { tag: 'iframe', attrs: { src: 'https://checkout.cakto.com.br/checkout_a3' } }
+      ]
+
+      const visit1 = runTrackerInVm({
+        url: 'https://meusite.com.br/landing?utm_source=facebook&utm_campaign=blackfriday&utm_medium=cpc&utm_content=video_a&src=facebook&sck=blackfriday',
+        domElements: dom1
+      })
+
+      assert.equal(visit1.utmTrack.utms.source, 'facebook', 'Visita 1: source deve ser facebook')
+      assert.equal(visit1.utmTrack.utms.campaign, 'blackfriday', 'Visita 1: campaign deve ser blackfriday')
+      assert.equal(visit1.utmTrack.utms.content, 'video_a', 'Visita 1: content deve ser video_a')
+
+      assert.ok(visit1.mockStorage['_utmt_campaign'], 'Visita 1: localStorage deve conter _utmt_campaign')
+      const storedV1 = JSON.parse(visit1.mockStorage['_utmt_campaign'])
+      assert.equal(storedV1.utms.source, 'facebook')
+      assert.equal(storedV1.utms.campaign, 'blackfriday')
+      assert.equal(storedV1.ttlDays, 30, 'TTL padrão deve ser 30 dias')
+      assert.ok(typeof storedV1.timestamp === 'number', 'Timestamp deve estar presente')
+
+      const decoratedLinkV1 = String(dom1[0]?.attrs['href'] || '')
+      assert.ok(decoratedLinkV1.includes('utm_source=facebook'), 'Checkout 1 decorado com utm_source')
+      assert.ok(decoratedLinkV1.includes('utm_campaign=blackfriday'), 'Checkout 1 decorado com utm_campaign')
+      assert.ok(decoratedLinkV1.includes('src=facebook'), 'Checkout 1 decorado com src')
+      assert.ok(decoratedLinkV1.includes('sck=blackfriday'), 'Checkout 1 decorado com sck')
+      assert.ok(decoratedLinkV1.includes(`_utmt_sid=${visit1.utmTrack.sessionId}`), 'Checkout 1 decorado com sessionId')
+      assert.ok(decoratedLinkV1.includes(`_utmt_vid=${visit1.utmTrack.visitorId}`), 'Checkout 1 decorado com visitorId')
+
+      const visitorId = visit1.utmTrack.visitorId
+      const sessionIdV1 = visit1.utmTrack.sessionId
+
+      // Criar sessão 1 no banco
+      await prisma.trackingSession.create({
+        data: {
+          sessionId: sessionIdV1,
+          visitorId,
+          workspaceId: testWorkspaceId,
+          utmSource: visit1.utmTrack.utms.source,
+          utmCampaign: visit1.utmTrack.utms.campaign,
+          utmMedium: visit1.utmTrack.utms.medium,
+          utmContent: visit1.utmTrack.utms.content,
+          firstSeenAt: new Date(Date.now() - 3 * 24 * 60 * 60 * 1000),
+          lastSeenAt: new Date(Date.now() - 3 * 24 * 60 * 60 * 1000)
+        }
+      })
+
+      // Visita 2: Visitante volta diretamente 3 dias depois (sem UTMs na URL)
+      const dom2 = [
+        { tag: 'a', attrs: { href: 'https://pay.kiwify.com.br/checkout_a1' } }
+      ]
+
+      const visit2 = runTrackerInVm({
+        url: 'https://meusite.com.br/landing',
+        localStorageData: visit1.mockStorage,
+        sessionStorageData: {},
+        domElements: dom2
+      })
+
+      assert.equal(visit2.utmTrack.visitorId, visitorId, 'Visita 2: visitorId deve ser mantido persistente')
+      assert.notEqual(visit2.utmTrack.sessionId, sessionIdV1, 'Visita 2: nova aba deve gerar novo sessionId')
+      const sessionIdV2 = visit2.utmTrack.sessionId
+
+      assert.equal(visit2.utmTrack.utms.source, 'facebook', 'Visita 2 direta: deve recuperar source do anúncio A')
+      assert.equal(visit2.utmTrack.utms.campaign, 'blackfriday', 'Visita 2 direta: deve recuperar campaign do anúncio A')
+      assert.equal(visit2.utmTrack.utms.content, 'video_a', 'Visita 2 direta: deve recuperar content do anúncio A')
+
+      const decoratedLinkV2 = String(dom2[0]?.attrs['href'] || '')
+      assert.ok(decoratedLinkV2.includes('utm_source=facebook'), 'Checkout visita direta: decorado com utm_source de A')
+      assert.ok(decoratedLinkV2.includes('utm_campaign=blackfriday'), 'Checkout visita direta: decorado com utm_campaign de A')
+      assert.ok(decoratedLinkV2.includes(`_utmt_sid=${sessionIdV2}`), 'Checkout visita direta: decorado com a nova sessionId')
+
+      await prisma.trackingSession.create({
+        data: {
+          sessionId: sessionIdV2,
+          visitorId,
+          workspaceId: testWorkspaceId,
+          utmSource: visit2.utmTrack.utms.source,
+          utmCampaign: visit2.utmTrack.utms.campaign,
+          utmMedium: visit2.utmTrack.utms.medium,
+          utmContent: visit2.utmTrack.utms.content,
+          firstSeenAt: new Date(),
+          lastSeenAt: new Date()
+        }
+      })
+
+      const sessions = await prisma.trackingSession.findMany({
+        where: { visitorId }
+      })
+      assert.equal(sessions.length, 2, 'Histórico preservado: o banco deve conter as 2 sessões distintas do visitante')
+
+      const saleResult1 = await upsertSale({
+        workspaceId: testWorkspaceId,
+        platform: 'kiwify',
+        externalId: `RET_DIRECT_SALE_${Date.now()}`,
+        status: 'approved',
+        grossAmount: 197,
+        netAmount: 180,
+        currency: 'BRL',
+        customerEmail: 'comprador.direto@exemplo.com',
+        sessionId: sessionIdV2,
+        orderedAt: new Date()
+      })
+
+      assert.equal(saleResult1.utmSource, 'facebook', 'Venda direta após anúncio A: herda utmSource da sessão resolvida')
+      assert.equal(saleResult1.utmCampaign, 'blackfriday', 'Venda direta após anúncio A: herda utmCampaign da sessão resolvida')
+
+      const attribution1 = await attemptAttribution(saleResult1.id)
+      assert.ok(attribution1, 'Registro de atribuição gerado')
+      assert.equal(attribution1.matchedBy, 'session', 'Atribuído diretamente pelo sessionId')
+      assert.equal(attribution1.confidence, 1.0, 'Confiança máxima no match por sessão exata')
+      assert.equal(attribution1.utmCampaign, 'blackfriday', 'Atribuição vinculada à campanha A')
+
+      // -------------------------------------------------------------------------
+      // CENÁRIO 2: A -> B -> Compra (Substituição Atômica)
+      // -------------------------------------------------------------------------
+      const visitA = runTrackerInVm({
+        url: 'https://meusite.com.br/?utm_source=facebook&utm_campaign=ad_a&utm_content=video1'
+      })
+      assert.equal(visitA.utmTrack.utms.campaign, 'ad_a')
+
+      const domB = [
+        { tag: 'a', attrs: { href: 'https://pay.kiwify.com.br/checkout_b' } }
+      ]
+      const visitB = runTrackerInVm({
+        url: 'https://meusite.com.br/?utm_source=google&utm_campaign=ad_b&utm_medium=cpc',
+        localStorageData: visitA.mockStorage,
+        domElements: domB
+      })
+
+      assert.equal(visitB.utmTrack.utms.source, 'google', 'Visita B: source deve ser google')
+      assert.equal(visitB.utmTrack.utms.campaign, 'ad_b', 'Visita B: campaign deve ser ad_b')
+      assert.equal(visitB.utmTrack.utms.medium, 'cpc', 'Visita B: medium deve ser cpc')
+      assert.equal(visitB.utmTrack.utms.content, null, 'Visita B: content deve ser null (NÃO herda video1 de A)')
+
+      const storedB = JSON.parse(visitB.mockStorage['_utmt_campaign'])
+      assert.equal(storedB.utms.campaign, 'ad_b', 'Storage deve estar atualizado com ad_b')
+      assert.equal(storedB.utms.content, null, 'Storage não deve conter content de A')
+
+      const decoratedLinkB = String(domB[0]?.attrs['href'] || '')
+      assert.ok(decoratedLinkB.includes('utm_source=google'), 'Checkout B tem utm_source=google')
+      assert.ok(decoratedLinkB.includes('utm_campaign=ad_b'), 'Checkout B tem utm_campaign=ad_b')
+      assert.ok(!decoratedLinkB.includes('video1'), 'Checkout B NÃO deve conter utm_content=video1')
+
+      // -------------------------------------------------------------------------
+      // CENÁRIO 3: Campanha expirada (> 30 dias) -> Retorno Direto
+      // -------------------------------------------------------------------------
+      const expiredTimestamp = Date.now() - 31 * 24 * 60 * 60 * 1000
+      const expiredStorage = {
+        '_utmt_campaign': JSON.stringify({
+          utms: { source: 'facebook', campaign: 'antiga_31_dias', medium: 'cpc' },
+          timestamp: expiredTimestamp,
+          ttlDays: 30
+        }),
+        '_utmt_vid': 'persistent_vid_123'
+      }
+
+      const domExp = [
+        { tag: 'a', attrs: { href: 'https://pay.kiwify.com.br/checkout_exp' } }
+      ]
+
+      const visitExp = runTrackerInVm({
+        url: 'https://meusite.com.br/promo',
+        localStorageData: expiredStorage,
+        domElements: domExp
+      })
+
+      assert.equal(visitExp.utmTrack.utms.source, null, 'Campanha expirada: source deve ser null')
+      assert.equal(visitExp.utmTrack.utms.campaign, null, 'Campanha expirada: campaign deve ser null')
+      assert.equal(visitExp.mockStorage['_utmt_campaign'], undefined, 'Campanha expirada deve ser removida do storage')
+
+      const decoratedLinkExp = String(domExp[0]?.attrs['href'] || '')
+      assert.ok(!decoratedLinkExp.includes('antiga_31_dias'), 'Checkout NÃO deve receber UTMs da campanha expirada')
+
+      // -------------------------------------------------------------------------
+      // CENÁRIO 4: Nova campanha com UTMs incompletas sem herdar campos da anterior
+      // -------------------------------------------------------------------------
+      const visitAlpha = runTrackerInVm({
+        url: 'https://meusite.com.br/?utm_source=meta&utm_campaign=black_friday&utm_content=banner_azul&utm_term=tenis_corrida'
+      })
+      assert.equal(visitAlpha.utmTrack.utms.content, 'banner_azul')
+      assert.equal(visitAlpha.utmTrack.utms.term, 'tenis_corrida')
+
+      const visitBeta = runTrackerInVm({
+        url: 'https://meusite.com.br/?utm_source=tiktok&utm_campaign=natal_ofertas',
+        localStorageData: visitAlpha.mockStorage
+      })
+      assert.equal(visitBeta.utmTrack.utms.source, 'tiktok')
+      assert.equal(visitBeta.utmTrack.utms.campaign, 'natal_ofertas')
+      assert.equal(visitBeta.utmTrack.utms.content, null, 'Beta NÃO deve herdar banner_azul de Alpha')
+      assert.equal(visitBeta.utmTrack.utms.term, null, 'Beta NÃO deve herdar tenis_corrida de Alpha')
+
+      // -------------------------------------------------------------------------
+      // CENÁRIO 5: Resiliência a Storage Indisponível / QuotaExceededError / JSON corrompido
+      // -------------------------------------------------------------------------
+      assert.doesNotThrow(() => {
+        const visitQuota = runTrackerInVm({
+          url: 'https://meusite.com.br/?utm_source=facebook&utm_campaign=resilience_test',
+          throwOnLocalStorageSet: true
+        })
+        assert.equal(visitQuota.utmTrack.utms.campaign, 'resilience_test', 'Mesmo com erro de quota, utms resolvidas são preservadas')
+      }, 'O tracker NÃO pode lançar erro não tratado se o localStorage falhar')
+
+      assert.doesNotThrow(() => {
+        const visitCorrupt = runTrackerInVm({
+          url: 'https://meusite.com.br/landing',
+          localStorageData: {
+            '_utmt_campaign': '{bad_json_not_valid_syntax...'
+          }
+        })
+        assert.equal(visitCorrupt.utmTrack.utms.campaign, null, 'JSON corrompido é tratado com segurança sem crash')
+      }, 'O tracker NÃO pode quebrar se o localStorage contiver dados inválidos')
+
+      // -------------------------------------------------------------------------
+      // CENÁRIO 6: TTL configurável via atributo data-campaign-ttl-days
+      // -------------------------------------------------------------------------
+      const visitCustomTtl = runTrackerInVm({
+        url: 'https://meusite.com.br/?utm_source=google&utm_campaign=short_campaign',
+        scriptAttrs: {
+          'data-campaign-ttl-days': '7'
+        }
+      })
+      assert.equal(visitCustomTtl.utmTrack.campaignTtlDays, 7, 'Configura TTL customizado de 7 dias')
+      const storedCustom = JSON.parse(visitCustomTtl.mockStorage['_utmt_campaign'])
+      assert.equal(storedCustom.ttlDays, 7, 'Payload gravado reflete o TTL customizado de 7 dias')
+
+    } finally {
+      // Limpeza de dados gerados no teste
+      await prisma.attributionRecord.deleteMany({ where: { workspaceId: testWorkspaceId } }).catch(() => {})
+      await prisma.sale.deleteMany({ where: { workspaceId: testWorkspaceId } }).catch(() => {})
+      await prisma.trackingSession.deleteMany({ where: { workspaceId: testWorkspaceId } }).catch(() => {})
     }
   })
 })

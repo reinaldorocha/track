@@ -11,8 +11,16 @@ export async function attemptAttribution(saleId: string) {
   let session = null
   let matchedBy = ''
   
-  // 1. Try to match by fbclid
-  if (sale.fbclid) {
+  // 1. Match direto por sessionId (sessão exata que originou o checkout decorado)
+  if (sale.sessionId) {
+    session = await prisma.trackingSession.findUnique({
+      where: { sessionId: sale.sessionId }
+    })
+    if (session) matchedBy = 'session'
+  }
+
+  // 2. Try to match by fbclid
+  if (!session && sale.fbclid) {
     session = await prisma.trackingSession.findFirst({
       where: { workspaceId: sale.workspaceId, fbclid: sale.fbclid },
       orderBy: { firstSeenAt: 'desc' }
@@ -20,21 +28,13 @@ export async function attemptAttribution(saleId: string) {
     if (session) matchedBy = 'fbclid'
   }
   
-  // 2. Try to match by fbp
+  // 3. Try to match by fbp
   if (!session && sale.fbp) {
     session = await prisma.trackingSession.findFirst({
       where: { workspaceId: sale.workspaceId, fbp: sale.fbp },
       orderBy: { firstSeenAt: 'desc' }
     })
     if (session) matchedBy = 'fbp'
-  }
-  
-  // 3. Try to match by sessionId
-  if (!session && sale.sessionId) {
-    session = await prisma.trackingSession.findUnique({
-      where: { sessionId: sale.sessionId }
-    })
-    if (session) matchedBy = 'session'
   }
   
   // 4. Try UTM campaign match (less reliable)
@@ -59,10 +59,10 @@ export async function attemptAttribution(saleId: string) {
       campaignId: session.campaignId,
       adAccountId: session.adAccountId,
       model: 'last_click',
-      confidence: matchedBy === 'fbclid' ? 1.0 : matchedBy === 'fbp' ? 0.9 : matchedBy === 'session' ? 0.85 : 0.5,
+      confidence: matchedBy === 'session' ? 1.0 : matchedBy === 'fbclid' ? 1.0 : matchedBy === 'fbp' ? 0.9 : 0.5,
       matchedBy,
-      fbclid: sale.fbclid,
-      utmCampaign: sale.utmCampaign
+      fbclid: sale.fbclid || session.fbclid,
+      utmCampaign: sale.utmCampaign || session.utmCampaign
     }
   })
 }

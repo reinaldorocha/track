@@ -543,6 +543,27 @@ export function normalizeSaleUtms(payload: Record<string, unknown>): {
 }
 
 export async function upsertSale(sale: InternalSale) {
+  // Hidratar UTMs e identificadores a partir da TrackingSession correspondente daquela sessão
+  if (sale.sessionId && (!sale.utmSource || !sale.utmCampaign)) {
+    try {
+      const session = await prisma.trackingSession.findUnique({
+        where: { sessionId: sale.sessionId }
+      })
+      if (session) {
+        sale.utmSource = sale.utmSource || session.utmSource || undefined
+        sale.utmMedium = sale.utmMedium || session.utmMedium || undefined
+        sale.utmCampaign = sale.utmCampaign || session.utmCampaign || undefined
+        sale.utmContent = sale.utmContent || session.utmContent || undefined
+        sale.utmTerm = sale.utmTerm || session.utmTerm || undefined
+        sale.fbclid = sale.fbclid || session.fbclid || undefined
+        sale.fbp = sale.fbp || session.fbp || undefined
+        sale.fbc = sale.fbc || session.fbc || undefined
+      }
+    } catch (e) {
+      console.error('[upsertSale] Error hydrating UTMs from TrackingSession:', e)
+    }
+  }
+
   const result = await prisma.sale.upsert({
     where: { 
       workspaceId_platform_externalId: { 
@@ -572,7 +593,7 @@ export async function upsertSale(sale: InternalSale) {
       fbp: sale.fbp,
       fbc: sale.fbc,
       sessionId: sale.sessionId,
-      orderedAt: sale.orderedAt,
+      orderedAt: sale.orderedAt || new Date(),
       approvedAt: sale.approvedAt,
       refundedAt: sale.refundedAt
     },
