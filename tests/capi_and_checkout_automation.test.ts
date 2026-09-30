@@ -2573,20 +2573,60 @@ describe('Automação CAPI, Decoração Real de Checkout, Roteamento por Produto
     assert.equal(payload1.pixelId, '987654321098765', 'Cenário 1: Pixel ID numérico repassado ao backend')
 
     // -------------------------------------------------------------------------
-    // CENÁRIO 2: fbq Pré-existente -> Reaproveita sem injetar script tag duplicada
+    // CENÁRIO 2A: Init do mesmo Pixel na fila do fbq (GTM / construtor pré-SDK) -> Não duplica init
     // -------------------------------------------------------------------------
-    const existingCalls: any[] = []
-    const mockFbq = function(...args: any[]) { existingCalls.push(args) }
-    const env2 = createTestEnv({
-      initialFbq: mockFbq,
+    const queueCallsA: any[] = []
+    const stubFbqA: any = function(...args: any[]) { queueCallsA.push(args) }
+    stubFbqA.queue = [
+      ['init', '111222333444555'] // GTM ou construtor já colocou init na fila!
+    ]
+    const env2A = createTestEnv({
+      initialFbq: stubFbqA,
       scriptAttrs: { 'data-pixel-id': '111222333444555' }
     })
-    vm.runInContext(trackerCode, env2.context)
+    vm.runInContext(trackerCode, env2A.context)
 
-    assert.equal(env2.createdScripts.length, 0, 'Cenário 2: NÃO injeta novo script fbevents.js quando fbq já existe')
-    assert.equal(env2.context.window.fbq, mockFbq, 'Cenário 2: Mantém a instância preexistente de fbq')
-    assert.ok(existingCalls.some(c => c[0] === 'init' && c[1] === '111222333444555'), 'Cenário 2: Inicializa o Pixel na instância existente')
-    assert.ok(existingCalls.some(c => c[0] === 'trackSingle' && c[1] === '111222333444555' && c[2] === 'PageView'), 'Cenário 2: Dispara trackSingle na instância existente')
+    assert.equal(env2A.createdScripts.length, 0, 'Cenário 2A: NÃO injeta novo script fbevents.js')
+    const initCallsA = queueCallsA.filter(c => c[0] === 'init')
+    assert.equal(initCallsA.length, 0, 'Cenário 2A: NÃO duplica fbq("init") quando já existe na fila')
+    assert.ok(queueCallsA.some(c => c[0] === 'trackSingle' && c[1] === '111222333444555' && c[2] === 'PageView'), 'Cenário 2A: Dispara PageView via trackSingle normalmente')
+
+    // -------------------------------------------------------------------------
+    // CENÁRIO 2B: Mesmo Pixel já inicializado no SDK ativo (getState / instance) -> Não duplica init
+    // -------------------------------------------------------------------------
+    const activeCallsB: any[] = []
+    const activeFbqB: any = function(...args: any[]) { activeCallsB.push(args) }
+    activeFbqB.getState = () => ({ pixels: [{ id: '222333444555666' }] })
+    activeFbqB.loaded = true
+    const env2B = createTestEnv({
+      initialFbq: activeFbqB,
+      scriptAttrs: { 'data-pixel-id': '222333444555666' }
+    })
+    vm.runInContext(trackerCode, env2B.context)
+
+    const initCallsB = activeCallsB.filter(c => c[0] === 'init')
+    assert.equal(initCallsB.length, 0, 'Cenário 2B: NÃO duplica fbq("init") quando SDK ativo já possui o Pixel')
+    assert.ok(activeCallsB.some(c => c[0] === 'trackSingle' && c[1] === '222333444555666' && c[2] === 'PageView'), 'Cenário 2B: Dispara PageView via trackSingle normalmente')
+
+    // -------------------------------------------------------------------------
+    // CENÁRIO 2C: Somente OUTRO Pixel inicializado na página -> Inicializa o nosso Pixel normalmente
+    // -------------------------------------------------------------------------
+    const callsC: any[] = []
+    const stubFbqC: any = function(...args: any[]) { callsC.push(args) }
+    stubFbqC.queue = [
+      ['init', '999999999999999'] // Apenas o pixel 999999999999999 está na fila
+    ]
+    const env2C = createTestEnv({
+      initialFbq: stubFbqC,
+      scriptAttrs: { 'data-pixel-id': '777777777777777' } // Nosso pixel é 777777777777777
+    })
+    vm.runInContext(trackerCode, env2C.context)
+
+    // O nosso pixel NÃO estava inicializado, então DEVE chamar init para 777777777777777
+    const initCallsC = callsC.filter(c => c[0] === 'init')
+    assert.equal(initCallsC.length, 1, 'Cenário 2C: Inicializa o pixel 777777777777777 normalmente')
+    assert.equal(initCallsC[0][1], '777777777777777', 'Cenário 2C: init chamado especificamente para o nosso Pixel')
+    assert.ok(callsC.some(c => c[0] === 'trackSingle' && c[1] === '777777777777777' && c[2] === 'PageView'), 'Cenário 2C: Dispara PageView via trackSingle para 777777777777777')
 
     // -------------------------------------------------------------------------
     // CENÁRIO 3: Inclusão Duplicada do Tracker na mesma página -> Idempotência via __utmTrackLoaded

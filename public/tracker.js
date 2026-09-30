@@ -291,6 +291,89 @@
   // =========================================================================
   // CARREGAMENTO AUTOMÁTICO DO SDK META PIXEL (fbevents.js) & DEDUPLICAÇÃO
   // =========================================================================
+
+  // Identifica defensivamente se o Pixel já está inicializado ou possui comando 'init' pendente no fbq
+  function isPixelInitializedOrQueued(targetPixelId) {
+    if (!targetPixelId) return false;
+    var cleanId = String(targetPixelId).trim();
+
+    // 1. Memória interna do próprio tracker
+    if (typeof window !== 'undefined' && window.__utmTrackInitializedPixels && window.__utmTrackInitializedPixels[cleanId]) {
+      return true;
+    }
+
+    // 2. Fila pendente do stub oficial da Meta (window.fbq.queue e window._fbq.queue)
+    try {
+      var queues = [];
+      if (typeof window !== 'undefined') {
+        if (window.fbq && Array.isArray(window.fbq.queue)) queues.push(window.fbq.queue);
+        if (window._fbq && Array.isArray(window._fbq.queue) && window._fbq.queue !== (window.fbq && window.fbq.queue)) {
+          queues.push(window._fbq.queue);
+        }
+      }
+
+      for (var q = 0; q < queues.length; q++) {
+        var queue = queues[q];
+        for (var i = 0; i < queue.length; i++) {
+          var item = queue[i];
+          if (item) {
+            // Suporta Arguments object ou array clássico: item[0] === 'init' e item[1] === cleanId
+            var cmd = item[0] || (item.length && item[0]);
+            var id = item[1] || (item.length > 1 && item[1]);
+            if (cmd === 'init' && String(id).trim() === cleanId) {
+              return true;
+            }
+          }
+        }
+      }
+    } catch(e) {}
+
+    // 3. SDK oficial da Meta já carregado e em execução no DOM (getState, instance, pixelsByID, etc.)
+    try {
+      if (typeof window !== 'undefined' && typeof window.fbq === 'function') {
+        // 3.1 fbq.getState().pixels
+        if (typeof window.fbq.getState === 'function') {
+          var state = window.fbq.getState();
+          if (state) {
+            if (Array.isArray(state.pixels)) {
+              for (var p = 0; p < state.pixels.length; p++) {
+                var px = state.pixels[p];
+                var pxId = (px && (px.id || px.pixelId)) || px;
+                if (pxId && String(pxId).trim() === cleanId) return true;
+              }
+            } else if (typeof state.pixels === 'object') {
+              if (state.pixels[cleanId]) return true;
+            }
+          }
+        }
+
+        // 3.2 fbq.instance.pixelsByID
+        if (window.fbq.instance && window.fbq.instance.pixelsByID) {
+          if (window.fbq.instance.pixelsByID[cleanId]) return true;
+        }
+
+        // 3.3 _fbq.instance.pixelsByID
+        if (window._fbq && window._fbq.instance && window._fbq.instance.pixelsByID) {
+          if (window._fbq.instance.pixelsByID[cleanId]) return true;
+        }
+
+        // 3.4 fbq.pixels ou _fbq.pixels (estrutura clássica de instâncias)
+        var pxMap = window.fbq.pixels || (window._fbq && window._fbq.pixels);
+        if (pxMap) {
+          if (Array.isArray(pxMap)) {
+            for (var m = 0; m < pxMap.length; m++) {
+              if (String(pxMap[m]).trim() === cleanId) return true;
+            }
+          } else if (typeof pxMap === 'object' && pxMap[cleanId]) {
+            return true;
+          }
+        }
+      }
+    } catch(e) {}
+
+    return false;
+  }
+
   function initMetaPixel() {
     if (!config.autoPixel || !config.pixelId) return;
 
@@ -347,12 +430,13 @@
         } catch(e) {}
       }
 
-      // 3. Inicializar o Pixel numérico informado uma única vez (SEM disparar PageView genérico!)
+      // 3. Inicializar o Pixel numérico informado APENAS se ainda não estiver inicializado nem enfileirado
       window.__utmTrackInitializedPixels = window.__utmTrackInitializedPixels || {};
-      if (!window.__utmTrackInitializedPixels[config.pixelId] && typeof window.fbq === 'function') {
+      var isAlreadyInit = isPixelInitializedOrQueued(config.pixelId);
+      if (!isAlreadyInit && typeof window.fbq === 'function') {
         window.fbq('init', config.pixelId);
-        window.__utmTrackInitializedPixels[config.pixelId] = true;
       }
+      window.__utmTrackInitializedPixels[config.pixelId] = true;
     } catch(err) {
       if (typeof console !== 'undefined' && console.warn) {
         console.warn('[UTM-Track] Erro na inicialização do Meta Pixel:', err);
@@ -741,6 +825,7 @@
     detectPlatform: detectPlatform,
     decorateUrl: decorateUrl,
     initMetaPixel: initMetaPixel,
+    isPixelInitializedOrQueued: isPixelInitializedOrQueued,
     sessionId: sessionId,
     visitorId: visitorId,
     pixelId: config.pixelId,
