@@ -201,8 +201,8 @@ export async function purgeTestSales(workspaceId?: string): Promise<number> {
     })
 
     const testSaleIds = candidateSales
-      .filter((sale: any) => isTestSaleRecord(sale))
-      .map((sale: any) => sale.id)
+      .filter(sale => isTestSaleRecord(sale))
+      .map(sale => sale.id)
 
     if (testSaleIds.length > 0) {
       await prisma.sale.deleteMany({
@@ -597,9 +597,9 @@ export async function upsertSale(sale: InternalSale) {
   })
 
   // Upsert de Produto e SaleItem quando informados
+  let resolvedProductId: string | undefined = undefined
   if (sale.productInfo?.name) {
     try {
-      let productId: string | undefined
       if (sale.productInfo.id) {
         const extProdId = String(sale.productInfo.id)
         let product = await prisma.product.findFirst({
@@ -633,7 +633,7 @@ export async function upsertSale(sale: InternalSale) {
             }
           })
         }
-        productId = product.id
+        resolvedProductId = product.id
       }
 
       const existingItem = await prisma.saleItem.findFirst({
@@ -643,7 +643,7 @@ export async function upsertSale(sale: InternalSale) {
         await prisma.saleItem.create({
           data: {
             saleId: result.id,
-            productId,
+            productId: resolvedProductId,
             externalProductId: sale.productInfo.id ? String(sale.productInfo.id) : undefined,
             name: String(sale.productInfo.name),
             sku: sale.productInfo.sku,
@@ -668,7 +668,7 @@ export async function upsertSale(sale: InternalSale) {
   // Disparo automático para Meta Conversions API (CAPI) em vendas aprovadas
   if (result.status === 'approved') {
     try {
-      dispatchPurchaseToCapi({
+      await dispatchPurchaseToCapi({
         workspaceId: result.workspaceId,
         saleId: result.id,
         externalId: result.externalId,
@@ -679,8 +679,9 @@ export async function upsertSale(sale: InternalSale) {
         fbp: result.fbp || undefined,
         fbc: result.fbc || undefined,
         sessionId: result.sessionId || undefined,
-        approvedAt: result.approvedAt || new Date()
-      }).catch((capiErr: unknown) => console.error('[upsertSale] CAPI Purchase dispatch error:', capiErr))
+        approvedAt: result.approvedAt || new Date(),
+        productId: resolvedProductId || undefined
+      })
     } catch (e) {
       console.error('[upsertSale] CAPI Purchase trigger error:', e)
     }

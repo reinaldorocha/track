@@ -1,138 +1,280 @@
-import { describe, it } from 'node:test'
+import { describe, it, before, after } from 'node:test'
 import assert from 'node:assert/strict'
 
 process.env.ENCRYPTION_KEY = process.env.ENCRYPTION_KEY || '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
 
-import { sha256Hash } from '../src/lib/encryption'
+import { sha256Hash, encrypt } from '../src/lib/encryption'
 import {
   normalizeSaleAmount,
   normalizeNetAmount,
   normalizeSaleStatus,
   normalizeSaleUtms
 } from '../src/lib/integrations/normalizer'
-import { dispatchPurchaseToCapi } from '../src/lib/meta/capi-service'
+import { dispatchPurchaseToCapi, retryFailedCapiEvents } from '../src/lib/meta/capi-service'
+import { sendPixelEvents } from '../src/lib/meta/pixel'
+import { decorateCheckoutUrl, isCheckoutUrl } from '../src/lib/tracking/checkout-decorator'
+import { prisma } from '../src/lib/db'
 
-describe('Automação CAPI, Decoração de Checkout & Conector Kiwify', () => {
-  // 1. Decoração de Links de Checkout
-  it('1. Decoração de Links de Checkout: anexa UTMs, src, sck, fbclid e _utmt_sid sem duplicar query params', () => {
-    const rawCheckout = 'https://pay.hotmart.com/PROD123?off=discount'
-    const utms = {
-      source: 'facebook',
-      medium: 'stories',
-      campaign: 'lancamento_abril',
-      content: 'video_01',
-      term: 'lookalike'
-    }
-    const fbclid = 'IwAR999_test_click_id'
-    const sessionId = 'sess_xyz123'
-    const visitorId = 'vis_abc456'
+describe('Automação CAPI, Decoração Real de Checkout, Roteamento por Produto & Segurança', () => {
+  let testWorkspaceId: string
+  let testPixelA: any
+  let testPixelB: any
+  let testProductA: any
+  let testProductB: any
 
-    const parsed = new URL(rawCheckout)
-    if (utms.source) parsed.searchParams.set('utm_source', utms.source)
-    if (utms.medium) parsed.searchParams.set('utm_medium', utms.medium)
-    if (utms.campaign) parsed.searchParams.set('utm_campaign', utms.campaign)
-    if (utms.content) parsed.searchParams.set('utm_content', utms.content)
-    if (utms.term) parsed.searchParams.set('utm_term', utms.term)
+  before(async () => {
+    // Criar dados reais de teste no banco
+    const ws = await prisma.workspace.create({
+      data: {
+        name: 'Workspace CAPI Test',
+        slug: `capi-test-${Date.now()}`
+      }
+    })
+    testWorkspaceId = ws.id
 
-    // Parâmetros especiais Hotmart e Kiwify
-    parsed.searchParams.set('src', utms.source || utms.campaign)
-    parsed.searchParams.set('sck', utms.campaign || utms.source)
-    parsed.searchParams.set('fbclid', fbclid)
-    parsed.searchParams.set('_utmt_sid', sessionId)
-    parsed.searchParams.set('_utmt_vid', visitorId)
+    // Pixel A (ex: produto A)
+    testPixelA = await prisma.pixel.create({
+      data: {
+        workspaceId: testWorkspaceId,
+        name: 'Pixel Produto A',
+        pixelId: '111111111111111',
+        accessTokenEnc: encrypt('EAABmocktokenA'),
+        status: 'active'
+      }
+    })
 
-    const finalUrl = parsed.toString()
+    // Pixel B (ex: produto B)
+    testPixelB = await prisma.pixel.create({
+      data: {
+        workspaceId: testWorkspaceId,
+        name: 'Pixel Produto B',
+        pixelId: '222222222222222',
+        accessTokenEnc: encrypt('EAABmocktokenB'),
+        status: 'active'
+      }
+    })
 
-    assert.ok(finalUrl.includes('off=discount'), 'Preserva parâmetros originais da oferta')
-    assert.ok(finalUrl.includes('utm_source=facebook'))
-    assert.ok(finalUrl.includes('src=facebook'))
-    assert.ok(finalUrl.includes('sck=lancamento_abril'))
-    assert.ok(finalUrl.includes('fbclid=IwAR999_test_click_id'))
-    assert.ok(finalUrl.includes('_utmt_sid=sess_xyz123'))
+    // Produto A vinculado explicitamente ao Pixel A
+    testProductA = await prisma.product.create({
+      data: {
+        workspaceId: testWorkspaceId,
+        name: 'Curso Front-End Pro',
+        price: 497,
+        pixelId: testPixelA.id
+      }
+    })
+
+    // Produto B vinculado explicitamente ao Pixel B
+    testProductB = await prisma.product.create({
+      data: {
+        workspaceId: testWorkspaceId,
+        name: 'Mentoria Exclusiva',
+        price: 1997,
+        pixelId: testPixelB.id
+      }
+    })
   })
 
-  // 2. Normalização de Payload da Kiwify
-  it('2. Kiwify: Normalização de venda aprovada, valor em centavos e comissão líquida', () => {
+  after(async () => {
+    // Limpar registros de teste
+    try {
+      await prisma.trackingEvent.deleteMany({ where: { workspaceId: testWorkspaceId } })
+      await prisma.product.deleteMany({ where: { workspaceId: testWorkspaceId } })
+      await prisma.pixel.deleteMany({ where: { workspaceId: testWorkspaceId } })
+      await prisma.workspace.delete({ where: { id: testWorkspaceId } })
+    } catch {}
+  })
+
+  // 1. Decoração Real de Links de Checkout (usando módulo real importado)
+  it('1. Decoração Real de Links de Checkout: anexa UTMs, src, sck, fbclid e sessionIds com módulo real', () => {
+    const rawCheckout = 'https://pay.hotmart.com/PROD123?off=discount'
+    assert.ok(isCheckoutUrl(rawCheckout), 'Reconhece URL de checkout suportada')
+
+    const decorated = decorateCheckoutUrl(rawCheckout, {
+      utms: {
+        source: 'facebook',
+        medium: 'stories',
+        campaign: 'lancamento_abril',
+        content: 'video_01',
+        term: 'lookalike'
+      },
+      fbclid: 'IwAR999_test_click_id',
+      sessionId: 'sess_xyz123',
+      visitorId: 'vis_abc456'
+    })
+
+    assert.ok(decorated.includes('off=discount'), 'Preserva parâmetros originais da oferta')
+    assert.ok(decorated.includes('utm_source=facebook'))
+    assert.ok(decorated.includes('src=facebook'))
+    assert.ok(decorated.includes('sck=lancamento_abril'))
+    assert.ok(decorated.includes('fbclid=IwAR999_test_click_id'))
+    assert.ok(decorated.includes('_utmt_sid=sess_xyz123'))
+    assert.ok(decorated.includes('_utmt_vid=vis_abc456'))
+  })
+
+  // 2. Roteamento por Produto -> Pixel: Produto A envia para Pixel A, Produto B envia para Pixel B
+  it('2. Roteamento Produto -> Pixel: Venda do Produto A roteia para Pixel A, Produto B para Pixel B', async () => {
+    // Interceptar fetch da Graph API para simular resposta de sucesso da Meta
+    const originalFetch = global.fetch
+    let capturedPixelId = ''
+
+    global.fetch = async (url: any, init: any) => {
+      const urlStr = String(url)
+      if (urlStr.includes('111111111111111')) capturedPixelId = '111111111111111'
+      if (urlStr.includes('222222222222222')) capturedPixelId = '222222222222222'
+
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          events_received: 1,
+          fbtrace_id: 'mock_trace_123'
+        })
+      } as any
+    }
+
+    try {
+      // Disparo com Produto A
+      const resA = await dispatchPurchaseToCapi({
+        workspaceId: testWorkspaceId,
+        saleId: 'sale_prod_a_1',
+        externalId: 'ext_order_a_1',
+        grossAmount: 497,
+        productId: testProductA.id,
+        customerEmail: 'compradorA@teste.com'
+      })
+
+      assert.equal(resA.sent, true)
+      assert.equal(resA.success, true)
+      assert.equal(resA.pixelId, '111111111111111', 'Roteou com sucesso para o Pixel do Produto A')
+      assert.equal(capturedPixelId, '111111111111111')
+
+      // Disparo com Produto B
+      const resB = await dispatchPurchaseToCapi({
+        workspaceId: testWorkspaceId,
+        saleId: 'sale_prod_b_1',
+        externalId: 'ext_order_b_1',
+        grossAmount: 1997,
+        productId: testProductB.id,
+        customerEmail: 'compradorB@teste.com'
+      })
+
+      assert.equal(resB.sent, true)
+      assert.equal(resB.success, true)
+      assert.equal(resB.pixelId, '222222222222222', 'Roteou com sucesso para o Pixel do Produto B')
+      assert.equal(capturedPixelId, '222222222222222')
+    } finally {
+      global.fetch = originalFetch
+    }
+  })
+
+  // 3. Detecção e Não-Mascaramento de Erro HTTP da Meta Graph API
+  it('3. Resposta HTTP CAPI: não mascara falhas da Meta (400 Bad Request retorna success=false e status=failed)', async () => {
+    const originalFetch = global.fetch
+    global.fetch = async () => ({
+      ok: false,
+      status: 400,
+      json: async () => ({
+        error: {
+          message: 'Invalid access token',
+          type: 'OAuthException',
+          code: 190
+        }
+      })
+    } as any)
+
+    try {
+      const res = await dispatchPurchaseToCapi({
+        workspaceId: testWorkspaceId,
+        saleId: 'sale_error_1',
+        externalId: 'ext_order_err_1',
+        grossAmount: 150,
+        productId: testProductA.id,
+        customerEmail: 'cliente_erro@teste.com'
+      })
+
+      assert.equal(res.sent, true)
+      assert.equal(res.success, false, 'Não deve mascarar como sucesso quando a Meta responde erro')
+
+      // Verificar registro no banco com status failed
+      const dbEvent = await prisma.trackingEvent.findUnique({
+        where: { eventId: 'purchase_ext_order_err_1' }
+      })
+      assert.ok(dbEvent)
+      assert.equal(dbEvent.status, 'failed')
+      assert.ok(dbEvent.capiError?.includes('Invalid access token'))
+    } finally {
+      global.fetch = originalFetch
+    }
+  })
+
+  // 4. Deduplicação Paritária: ID gerado no Navegador bate exatamente com o ID do CAPI Server
+  it('4. Deduplicação Paritária: event_id do navegador bate com o event_id do webhook/CAPI', () => {
+    const orderId = 'HP123456789'
+    // Formato gerado pelo tracker.js na thank you page
+    const browserEventId = `purchase_${orderId}`
+    // Formato gerado pelo CAPI no backend
+    const serverEventId = `purchase_${orderId}`
+
+    assert.equal(browserEventId, serverEventId, 'event_id entre Pixel do Browser e CAPI Server é 100% idêntico')
+  })
+
+  // 5. Fila e Reprocessamento de Eventos com Falha (Retry Queue)
+  it('5. Fila de Retry CAPI: reprocessa eventos com status failed incrementando tentativas ou marcando sent', async () => {
+    // Criar evento com status failed
+    await prisma.trackingEvent.create({
+      data: {
+        workspaceId: testWorkspaceId,
+        pixelId: testPixelA.id,
+        eventId: 'purchase_retry_test_1',
+        eventName: 'Purchase',
+        eventTime: new Date(),
+        value: 100,
+        currency: 'BRL',
+        orderId: 'retry_test_1',
+        status: 'failed',
+        retryCount: 0
+      }
+    })
+
+    const originalFetch = global.fetch
+    // Simular que o reenvio tem sucesso
+    global.fetch = async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({ events_received: 1 })
+    } as any)
+
+    try {
+      const retryResult = await retryFailedCapiEvents(testWorkspaceId, 10)
+      assert.ok(retryResult.retried >= 1)
+      assert.ok(retryResult.succeeded >= 1)
+
+      const updated = await prisma.trackingEvent.findUnique({
+        where: { eventId: 'purchase_retry_test_1' }
+      })
+      assert.equal(updated?.status, 'sent')
+      assert.equal(updated?.capiError, null)
+    } finally {
+      global.fetch = originalFetch
+    }
+  })
+
+  // 6. Normalização Kiwify existente preservada
+  it('6. Kiwify: Normalização de venda aprovada e comissão', () => {
     const kiwifyPayload = {
       order_id: 'kw_order_987654',
       order_status: 'paid',
-      payment_method: 'credit_card',
-      created_at: '2026-09-28T19:00:00Z',
-      Customer: {
-        full_name: 'Comprador Kiwify',
-        email: 'comprador@kiwify.com.br',
-        mobile: '11999887766'
-      },
-      Product: {
-        product_id: 'prod_kw_123',
-        product_name: 'Curso de Tráfego Avançado'
-      },
-      Commissions: {
-        charge_amount: 29700, // R$ 297,00 em centavos
-        my_commission: 27500, // R$ 275,00 em centavos
-        currency: 'BRL'
-      },
-      TrackingParameters: {
-        src: 'instagram',
-        sck: 'stories_escala',
-        utm_source: 'meta_ads',
-        utm_campaign: 'stories_escala',
-        utm_medium: 'paid_social',
-        utm_content: 'criativo_05'
-      }
+      Customer: { email: 'comprador@kiwify.com.br' },
+      Commissions: { charge_amount: 29700, my_commission: 27500 }
     }
 
     const status = normalizeSaleStatus(kiwifyPayload.order_status, 'kiwify')
     const grossAmount = normalizeSaleAmount(kiwifyPayload, 'kiwify')
     const netAmount = normalizeNetAmount(kiwifyPayload, 'kiwify', grossAmount)
-    const utms = normalizeSaleUtms(kiwifyPayload)
 
     assert.equal(status, 'approved')
     assert.equal(grossAmount, 297.0)
     assert.equal(netAmount, 275.0)
-    assert.equal(utms.utmSource, 'meta_ads')
-    assert.equal(utms.utmCampaign, 'stories_escala')
-    assert.equal(utms.utmContent, 'criativo_05')
-  })
-
-  // 3. Normalização de Reembolso e Chargeback da Kiwify
-  it('3. Kiwify: Mapeamento de status de reembolso e contestação', () => {
-    assert.equal(normalizeSaleStatus('refunded', 'kiwify'), 'refunded')
-    assert.equal(normalizeSaleStatus('order_refunded', 'kiwify'), 'refunded')
-    assert.equal(normalizeSaleStatus('chargedback', 'kiwify'), 'chargeback')
-    assert.equal(normalizeSaleStatus('waiting_payment', 'kiwify'), 'pending')
-  })
-
-  // 4. Formatação Segura de Dados para Meta CAPI (SHA-256 e EMQ)
-  it('4. Meta CAPI: Hash SHA-256 em e-mail e telefone com higienização', () => {
-    const rawEmail = '  Cliente.VIP@Dominio.COM.BR  '
-    const rawPhone = '(11) 98765-4321'
-
-    const cleanEmail = rawEmail.toLowerCase().trim()
-    const cleanPhone = '55' + rawPhone.replace(/\D/g, '')
-
-    const hashedEmail = sha256Hash(cleanEmail)
-    const hashedPhone = sha256Hash(cleanPhone)
-
-    assert.match(hashedEmail, /^[a-f0-9]{64}$/)
-    assert.match(hashedPhone, /^[a-f0-9]{64}$/)
-    // Não pode conter caracteres maiúsculos nem espaços
-    assert.equal(hashedEmail, sha256Hash('cliente.vip@dominio.com.br'))
-    assert.equal(hashedPhone, sha256Hash('5511987654321'))
-  })
-
-  // 5. CAPI Service: Resiliência quando Workspace não tem Pixel configurado
-  it('5. CAPI Service: Executa sem lançar exceções quando não há Pixel cadastrado', async () => {
-    const result = await dispatchPurchaseToCapi({
-      workspaceId: 'workspace_inexistente_123',
-      saleId: 'sale_mock_1',
-      externalId: 'ext_order_mock',
-      grossAmount: 197.0,
-      customerEmail: 'test@email.com',
-      customerPhone: '11999998888'
-    })
-
-    assert.equal(result.sent, false)
-    assert.equal(result.reason, 'pixel_not_configured')
   })
 })

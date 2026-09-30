@@ -22,8 +22,11 @@ export async function POST(req: Request) {
     const bearerToken = authHeader.toLowerCase().startsWith('bearer ') ? authHeader.slice(7).trim() : null
     const token = searchParams.get('token') || searchParams.get('signature') || req.headers.get('x-getfy-signature') || bearerToken
 
-    if (process.env.GETFY_WEBHOOK_SECRET && token && token !== process.env.GETFY_WEBHOOK_SECRET) {
-      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+    const expectedSecret = process.env.GETFY_WEBHOOK_SECRET
+    if (expectedSecret) {
+      if (!token || token !== expectedSecret) {
+        return NextResponse.json({ error: 'Unauthorized: missing or invalid webhook token' }, { status: 401 })
+      }
     }
 
     const rawBody = await req.json().catch(() => null)
@@ -41,7 +44,15 @@ export async function POST(req: Request) {
 
     const orderId = String(order.id || envelopePayload.order_id || envelopePayload.orderId || envelopePayload.id || `GETFY_${Date.now()}`)
 
-    let workspaceId: string | null | undefined = queryWs
+    let workspaceId: string | null | undefined = null
+    if (queryWs) {
+      const validWs = await prisma.workspace.findUnique({ where: { id: queryWs } })
+      if (!validWs) {
+        return NextResponse.json({ error: 'Invalid workspaceId' }, { status: 404 })
+      }
+      workspaceId = validWs.id
+    }
+
     if (!workspaceId) {
       const integration = await prisma.integration.findFirst({
         where: { platform: 'getfy' }

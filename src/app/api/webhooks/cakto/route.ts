@@ -14,8 +14,10 @@ export async function POST(req: Request) {
   try {
     const signature = req.headers.get('x-cakto-signature') || req.headers.get('x-cacto-signature') || req.headers.get('Authorization')
     const secret = process.env.CAKTO_WEBHOOK_SECRET || process.env.CACTO_WEBHOOK_SECRET
-    if (secret && signature && signature !== secret && signature !== `Bearer ${secret}`) {
-      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+    if (secret) {
+      if (!signature || (signature !== secret && signature !== `Bearer ${secret}`)) {
+        return NextResponse.json({ error: 'Unauthorized: missing or invalid signature' }, { status: 401 })
+      }
     }
 
     const { searchParams } = new URL(req.url)
@@ -29,7 +31,15 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: 'Invalid payload: missing transaction id' }, { status: 400 })
     }
 
-    let workspaceId: string | null | undefined = queryWs
+    let workspaceId: string | null | undefined = null
+    if (queryWs) {
+      const validWs = await prisma.workspace.findUnique({ where: { id: queryWs } })
+      if (!validWs) {
+        return NextResponse.json({ error: 'Invalid workspaceId' }, { status: 404 })
+      }
+      workspaceId = validWs.id
+    }
+
     if (!workspaceId) {
       const integration = await prisma.integration.findFirst({
         where: { platform: { in: ['cakto', 'cacto'] } }

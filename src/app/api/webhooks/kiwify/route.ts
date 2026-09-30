@@ -18,8 +18,12 @@ export async function POST(req: Request) {
     const queryWs = searchParams.get('workspaceId') || searchParams.get('workspace_id') || req.headers.get('x-workspace-id')
     const token = searchParams.get('token') || searchParams.get('signature') || req.headers.get('x-kiwify-signature')
 
-    if (process.env.KIWIFY_WEBHOOK_SECRET && token && token !== process.env.KIWIFY_WEBHOOK_SECRET) {
-      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+    const expectedSecret = process.env.KIWIFY_WEBHOOK_SECRET
+    // Se o segredo está configurado, o token é estritamente OBRIGATÓRIO e deve bater
+    if (expectedSecret) {
+      if (!token || token !== expectedSecret) {
+        return NextResponse.json({ error: 'Unauthorized: missing or invalid webhook signature/token' }, { status: 401 })
+      }
     }
 
     const payload = await req.json().catch(() => null)
@@ -30,7 +34,15 @@ export async function POST(req: Request) {
     const orderId = String(payload.order_id || payload.orderId || payload.id || `KIWIFY_${Date.now()}`)
     const rawStatus = String(payload.order_status || payload.status || 'paid')
 
-    let workspaceId: string | null | undefined = queryWs
+    let workspaceId: string | null | undefined = null
+    if (queryWs) {
+      const validWs = await prisma.workspace.findUnique({ where: { id: queryWs } })
+      if (!validWs) {
+        return NextResponse.json({ error: 'Invalid workspaceId' }, { status: 404 })
+      }
+      workspaceId = validWs.id
+    }
+
     if (!workspaceId) {
       const integration = await prisma.integration.findFirst({
         where: { platform: 'kiwify' }

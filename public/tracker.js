@@ -299,9 +299,51 @@
     }
   }, true);
   
-  // Public API para chamadas manuais (ex: window.utmTrack.track('Lead', { value: 10 }))
+  // 3. Detecção e Disparo Automático de Purchase em Páginas de Obrigado / Confirmação com deduplicação CAPI
+  (function detectThankYouPage() {
+    var path = location.pathname.toLowerCase();
+    var isThankYou = path.indexOf('obrigad') !== -1 ||
+                     path.indexOf('thank') !== -1 ||
+                     path.indexOf('sucesso') !== -1 ||
+                     path.indexOf('confirm') !== -1 ||
+                     document.querySelector('[data-utm-purchase]') !== null;
+
+    var orderId = getParam('order_id') || getParam('transaction') || getParam('order') || getParam('id');
+    if (isThankYou && orderId) {
+      var storageKey = '_utmt_purchased_' + orderId;
+      try {
+        if (!sessionStorage.getItem(storageKey)) {
+          sessionStorage.setItem(storageKey, 'true');
+          var val = parseFloat(getParam('value') || getParam('amount') || '0');
+          var curr = getParam('currency') || 'BRL';
+          var purchaseEventId = 'purchase_' + orderId;
+
+          fireBrowserPixel('Purchase', {
+            value: val,
+            currency: curr,
+            order_id: orderId,
+            content_type: 'product'
+          }, purchaseEventId);
+
+          send('/api/tracking/event', {
+            sessionId: sessionId,
+            workspaceId: config.workspaceId,
+            eventName: 'Purchase',
+            eventId: purchaseEventId,
+            orderId: orderId,
+            value: val,
+            currency: curr,
+            sourceUrl: location.href
+          });
+        }
+      } catch(e) {}
+    }
+  })();
+
+  // Public API para chamadas manuais (ex: window.utmTrack.track('Lead', { value: 10 }) ou trackPurchase)
   window.utmTrack = {
     track: function(eventName, data) {
+      data = data || {};
       var customEventId = genEventId();
       fireBrowserPixel(eventName, data, customEventId);
       send('/api/tracking/event', Object.assign({}, data, {
@@ -311,6 +353,33 @@
         eventId: customEventId,
         sourceUrl: location.href
       }));
+      return customEventId;
+    },
+    trackPurchase: function(data) {
+      data = data || {};
+      var orderId = data.orderId || data.order_id || data.transaction || getParam('order_id') || getParam('transaction') || getParam('order');
+      var purchaseEventId = orderId ? ('purchase_' + orderId) : genEventId();
+      var val = Number(data.value || data.amount || getParam('value') || 0);
+      var curr = data.currency || getParam('currency') || 'BRL';
+
+      fireBrowserPixel('Purchase', {
+        value: val,
+        currency: curr,
+        order_id: orderId || undefined,
+        content_type: 'product'
+      }, purchaseEventId);
+
+      send('/api/tracking/event', {
+        sessionId: sessionId,
+        workspaceId: config.workspaceId,
+        eventName: 'Purchase',
+        eventId: purchaseEventId,
+        orderId: orderId || undefined,
+        value: val,
+        currency: curr,
+        sourceUrl: location.href
+      });
+      return purchaseEventId;
     },
     decorateUrl: decorateUrl,
     sessionId: sessionId,

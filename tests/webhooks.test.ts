@@ -643,5 +643,81 @@ describe('Integrações e Normalização de Webhooks', () => {
     assert.equal(key1, key2)
     assert.equal(key1, 'getfy_90001_approved')
   })
+
+  // Segurança de Webhooks (Kiwify e Hotmart)
+  it('Segurança Webhooks: Kiwify rejeita requisição sem token quando segredo está configurado', async () => {
+    const { POST: kiwifyPost } = await import('../src/app/api/webhooks/kiwify/route')
+    const originalSecret = process.env.KIWIFY_WEBHOOK_SECRET
+    process.env.KIWIFY_WEBHOOK_SECRET = 'super_secret_kiwify_123'
+
+    try {
+      // 1. Requisição SEM token
+      const reqNoToken = new Request('http://localhost/api/webhooks/kiwify', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ order_id: 'kw_test_sec_1', order_status: 'paid' })
+      })
+      const resNoToken = await kiwifyPost(reqNoToken)
+      assert.equal(resNoToken.status, 401, 'Deve rejeitar com 401 quando token está ausente')
+
+      // 2. Requisição com token INCORRETO
+      const reqWrongToken = new Request('http://localhost/api/webhooks/kiwify?token=token_errado', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ order_id: 'kw_test_sec_2', order_status: 'paid' })
+      })
+      const resWrongToken = await kiwifyPost(reqWrongToken)
+      assert.equal(resWrongToken.status, 401, 'Deve rejeitar com 401 quando token é inválido')
+
+      // 3. Requisição com workspaceId INEXISTENTE
+      const reqInvalidWs = new Request('http://localhost/api/webhooks/kiwify?token=super_secret_kiwify_123&workspaceId=ws_fantasma_999', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ order_id: 'kw_test_sec_3', order_status: 'paid' })
+      })
+      const resInvalidWs = await kiwifyPost(reqInvalidWs)
+      assert.equal(resInvalidWs.status, 404, 'Deve rejeitar com 404 quando workspaceId não existe')
+    } finally {
+      process.env.KIWIFY_WEBHOOK_SECRET = originalSecret
+    }
+  })
+
+  it('Segurança Webhooks: Hotmart rejeita requisição sem hottok quando segredo está configurado', async () => {
+    const { POST: hotmartPost } = await import('../src/app/api/webhooks/hotmart/route')
+    const originalSecret = process.env.HOTMART_WEBHOOK_SECRET
+    process.env.HOTMART_WEBHOOK_SECRET = 'super_hottok_secret_456'
+
+    try {
+      // 1. Requisição SEM hottok
+      const reqNoHottok = new Request('http://localhost/api/webhooks/hotmart', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          event: 'PURCHASE_APPROVED',
+          data: { purchase: { transaction: 'HP_SEC_1', price: { value: 100 } } }
+        })
+      })
+      const resNoHottok = await hotmartPost(reqNoHottok)
+      assert.equal(resNoHottok.status, 401, 'Deve rejeitar com 401 quando hottok está ausente')
+
+      // 2. Requisição com hottok INCORRETO
+      const reqWrongHottok = new Request('http://localhost/api/webhooks/hotmart', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-hotmart-hottok': 'hottok_errado'
+        },
+        body: JSON.stringify({
+          event: 'PURCHASE_APPROVED',
+          data: { purchase: { transaction: 'HP_SEC_2', price: { value: 100 } } }
+        })
+      })
+      const resWrongHottok = await hotmartPost(reqWrongHottok)
+      assert.equal(resWrongHottok.status, 401, 'Deve rejeitar com 401 quando hottok é inválido')
+    } finally {
+      process.env.HOTMART_WEBHOOK_SECRET = originalSecret
+    }
+  })
 })
+
 

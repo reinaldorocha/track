@@ -15,17 +15,20 @@ import { createSaleNotification, SaleNotificationType } from '@/lib/notification
 export async function POST(req: Request) {
   let webhookEventId: string | null = null
   try {
-    const hottok = req.headers.get('x-hotmart-hottok')
-    if (process.env.HOTMART_WEBHOOK_SECRET && hottok && hottok !== process.env.HOTMART_WEBHOOK_SECRET) {
-      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-    }
-
     const { searchParams } = new URL(req.url)
     const queryWs = searchParams.get('workspaceId') || searchParams.get('workspace_id') || req.headers.get('x-workspace-id')
 
     const payload = await req.json().catch(() => null)
     if (!payload) {
       return NextResponse.json({ error: 'Invalid JSON payload' }, { status: 400 })
+    }
+
+    const hottok = req.headers.get('x-hotmart-hottok') || searchParams.get('hottok') || (payload && typeof payload.hottok === 'string' ? payload.hottok : null)
+    const expectedSecret = process.env.HOTMART_WEBHOOK_SECRET
+    if (expectedSecret) {
+      if (!hottok || hottok !== expectedSecret) {
+        return NextResponse.json({ error: 'Unauthorized: missing or invalid hottok token' }, { status: 401 })
+      }
     }
 
     const event = String(payload.event || payload.event_type || 'PURCHASE_APPROVED')
@@ -38,7 +41,15 @@ export async function POST(req: Request) {
 
     const transaction = String(purchase.transaction || payload.transaction || payload.id || `HOTMART_${Date.now()}`)
 
-    let workspaceId: string | null | undefined = queryWs
+    let workspaceId: string | null | undefined = null
+    if (queryWs) {
+      const validWs = await prisma.workspace.findUnique({ where: { id: queryWs } })
+      if (!validWs) {
+        return NextResponse.json({ error: 'Invalid workspaceId' }, { status: 404 })
+      }
+      workspaceId = validWs.id
+    }
+
     if (!workspaceId) {
       const integration = await prisma.integration.findFirst({ 
         where: { platform: 'hotmart' } 

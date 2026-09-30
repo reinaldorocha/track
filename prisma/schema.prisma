@@ -306,6 +306,7 @@ model Pixel {
 
   workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
   events    TrackingEvent[]
+  products  Product[]
 
   @@unique([workspaceId, pixelId])
 }
@@ -379,6 +380,7 @@ model TrackingEvent {
   status          String   @default("received") // received, sent, failed
   capiResponse    String?  // JSON response from Meta CAPI
   capiError       String?
+  retryCount      Int      @default(0)
   sentAt          DateTime?
   createdAt       DateTime @default(now())
 
@@ -498,10 +500,12 @@ model Product {
   cost        Float?   @default(0) // Product cost (COGS)
   currency    String   @default("BRL")
   isActive    Boolean  @default(true)
+  pixelId     String?  // Meta Pixel especificamente vinculado a este produto
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
 
   workspace Workspace  @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  pixel     Pixel?     @relation(fields: [pixelId], references: [id], onDelete: SetNull)
   saleItems SaleItem[]
   fees      ProductFee[]
   taxes     ProductTax[]

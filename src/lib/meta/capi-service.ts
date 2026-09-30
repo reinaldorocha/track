@@ -14,6 +14,8 @@ export interface DispatchPurchaseParams {
   fbc?: string
   sessionId?: string
   approvedAt?: Date
+  productId?: string
+  pixelId?: string
 }
 
 export interface DispatchNavigationParams {
@@ -27,11 +29,12 @@ export interface DispatchNavigationParams {
   contentIds?: string
   clientIp?: string
   clientUserAgent?: string
+  pixelId?: string
 }
 
 /**
  * Dispara automaticamente evento de Purchase para a Meta Conversions API (CAPI)
- * com hash seguro SHA-256 de dados do comprador e deduplicação via event_id.
+ * com roteamento por produto -> pixel, hash SHA-256 e deduplicação via event_id.
  */
 export async function dispatchPurchaseToCapi(params: DispatchPurchaseParams) {
   try {
@@ -46,19 +49,67 @@ export async function dispatchPurchaseToCapi(params: DispatchPurchaseParams) {
       fbp,
       fbc,
       sessionId,
-      approvedAt
+      approvedAt,
+      productId,
+      pixelId: directPixelId
     } = params
 
     if (!workspaceId) return { sent: false, reason: 'missing_workspace_id' }
 
-    // 1. Localizar Pixel ativo configurado para este Workspace
-    const pixel = await prisma.pixel.findFirst({
-      where: {
-        workspaceId,
-        status: 'active',
-        accessTokenEnc: { not: null }
+    // 1. Roteamento Inteligente do Pixel:
+    // 1.1 Se pixelId for fornecido diretamente
+    let pixel = null
+    if (directPixelId) {
+      pixel = await prisma.pixel.findFirst({
+        where: { id: directPixelId, workspaceId, status: 'active', accessTokenEnc: { not: null } }
+      })
+    }
+
+    // 1.2 Se temos productId, buscar o pixel explicitamente vinculado ao produto
+    if (!pixel && productId) {
+      const prod = await prisma.product.findFirst({
+        where: { id: productId, workspaceId },
+        select: { pixelId: true }
+      })
+      if (prod?.pixelId) {
+        pixel = await prisma.pixel.findFirst({
+          where: { id: prod.pixelId, workspaceId, status: 'active', accessTokenEnc: { not: null } }
+        })
       }
-    })
+    }
+
+    // 1.3 Se não encontrou, verificar se a venda tem items com produto vinculado a um pixel
+    if (!pixel && (saleId || externalId)) {
+      const saleWithItem = await prisma.sale.findFirst({
+        where: {
+          workspaceId,
+          OR: [{ id: saleId }, { externalId: externalId }]
+        },
+        include: {
+          items: {
+            include: { product: true }
+          }
+        }
+      })
+
+      const itemWithPixel = saleWithItem?.items?.find(it => it.product?.pixelId)
+      if (itemWithPixel?.product?.pixelId) {
+        pixel = await prisma.pixel.findFirst({
+          where: { id: itemWithPixel.product.pixelId, workspaceId, status: 'active', accessTokenEnc: { not: null } }
+        })
+      }
+    }
+
+    // 1.4 Fallback para o Pixel padrão ativo do Workspace
+    if (!pixel) {
+      pixel = await prisma.pixel.findFirst({
+        where: {
+          workspaceId,
+          status: 'active',
+          accessTokenEnc: { not: null }
+        }
+      })
+    }
 
     if (!pixel || !pixel.accessTokenEnc) {
       return { sent: false, reason: 'pixel_not_configured' }
@@ -99,7 +150,6 @@ export async function dispatchPurchaseToCapi(params: DispatchPurchaseParams) {
     if (customerPhone && customerPhone.trim()) {
       const cleanPhone = customerPhone.replace(/\D/g, '')
       if (cleanPhone.length >= 8) {
-        // Se não tiver DDI 55 (Brasil) e tiver 10 ou 11 dígitos, adiciona
         const formattedPhone = (cleanPhone.length === 10 || cleanPhone.length === 11) ? `55${cleanPhone}` : cleanPhone
         userData.ph = [sha256Hash(formattedPhone)]
       }
@@ -131,11 +181,23 @@ export async function dispatchPurchaseToCapi(params: DispatchPurchaseParams) {
       pixel.testEventCode || undefined
     )
 
-    const isSuccess = Boolean(capiResult && (capiResult.events_received !== undefined || !capiResult.error))
+    const isSuccess = Boolean(
+      capiResult &&
+      capiResult.ok !== false &&
+      !capiResult.error &&
+      (typeof capiResult.events_received === 'number' ? capiResult.events_received > 0 : true)
+    )
 
-    // 6. Gravar log em TrackingEvent para auditoria no painel
-    await prisma.trackingEvent.create({
-      data: {
+    // 6. Gravar log em TrackingEvent para auditoria no painel e resiliência
+    await prisma.trackingEvent.upsert({
+      where: { eventId },
+      update: {
+        status: isSuccess ? 'sent' : 'failed',
+        capiResponse: JSON.stringify(capiResult),
+        capiError: isSuccess ? null : JSON.stringify(capiResult?.error || 'Nenhum evento aceito pela Meta'),
+        sentAt: isSuccess ? new Date() : null,
+      },
+      create: {
         eventId,
         workspaceId,
         pixelId: pixel.id,
@@ -147,13 +209,14 @@ export async function dispatchPurchaseToCapi(params: DispatchPurchaseParams) {
         orderId: externalId || saleId,
         status: isSuccess ? 'sent' : 'failed',
         capiResponse: JSON.stringify(capiResult),
-        capiError: capiResult?.error ? JSON.stringify(capiResult.error) : null,
-        sentAt: new Date()
+        capiError: isSuccess ? null : JSON.stringify(capiResult?.error || 'Nenhum evento aceito pela Meta'),
+        sentAt: isSuccess ? new Date() : null,
+        retryCount: 0
       }
     }).catch(err => console.error('[CAPI Service] Erro ao gravar TrackingEvent Purchase:', err))
 
-    console.log(`[CAPI Service] Purchase enviado com sucesso para Meta (Pixel ${pixel.pixelId}, Order ${externalId}):`, capiResult)
-    return { sent: true, success: isSuccess, result: capiResult }
+    console.log(`[CAPI Service] Purchase processado para Meta (Pixel ${pixel.pixelId}, Order ${externalId || saleId}, Sucesso: ${isSuccess}):`, capiResult)
+    return { sent: true, success: isSuccess, result: capiResult, pixelId: pixel.pixelId }
   } catch (error) {
     console.error('[CAPI Service] Erro inesperado no dispatchPurchaseToCapi:', error)
     return { sent: false, error: error instanceof Error ? error.message : 'Unknown error' }
@@ -180,13 +243,23 @@ export async function dispatchNavigationToCapi(params: DispatchNavigationParams)
 
     if (!workspaceId) return { sent: false, reason: 'missing_workspace_id' }
 
-    const pixel = await prisma.pixel.findFirst({
-      where: {
-        workspaceId,
-        status: 'active',
-        accessTokenEnc: { not: null }
-      }
-    })
+    // Se pixelId foi fornecido diretamente
+    let pixel = null
+    if (params.pixelId) {
+      pixel = await prisma.pixel.findFirst({
+        where: { id: params.pixelId, workspaceId, status: 'active', accessTokenEnc: { not: null } }
+      })
+    }
+
+    if (!pixel) {
+      pixel = await prisma.pixel.findFirst({
+        where: {
+          workspaceId,
+          status: 'active',
+          accessTokenEnc: { not: null }
+        }
+      })
+    }
 
     if (!pixel || !pixel.accessTokenEnc) {
       return { sent: false, reason: 'pixel_not_configured' }
@@ -195,7 +268,7 @@ export async function dispatchNavigationToCapi(params: DispatchNavigationParams)
     let accessToken: string
     try {
       accessToken = decrypt(pixel.accessTokenEnc)
-    } catch (e) {
+    } catch {
       return { sent: false, reason: 'decrypt_token_failed' }
     }
 
@@ -243,7 +316,12 @@ export async function dispatchNavigationToCapi(params: DispatchNavigationParams)
       pixel.testEventCode || undefined
     )
 
-    const isSuccess = Boolean(capiResult && (capiResult.events_received !== undefined || !capiResult.error))
+    const isSuccess = Boolean(
+      capiResult &&
+      capiResult.ok !== false &&
+      !capiResult.error &&
+      (typeof capiResult.events_received === 'number' ? capiResult.events_received > 0 : true)
+    )
 
     // Atualizar status no TrackingEvent
     await prisma.trackingEvent.updateMany({
@@ -252,14 +330,114 @@ export async function dispatchNavigationToCapi(params: DispatchNavigationParams)
         pixelId: pixel.id,
         status: isSuccess ? 'sent' : 'failed',
         capiResponse: JSON.stringify(capiResult),
-        capiError: capiResult?.error ? JSON.stringify(capiResult.error) : null,
-        sentAt: new Date()
+        capiError: isSuccess ? null : JSON.stringify(capiResult?.error || 'Nenhum evento aceito pela Meta'),
+        sentAt: isSuccess ? new Date() : null
       }
     }).catch(() => {})
 
-    return { sent: true, success: isSuccess, result: capiResult }
+    return { sent: true, success: isSuccess, result: capiResult, pixelId: pixel.pixelId }
   } catch (error) {
     console.error('[CAPI Service] Erro no dispatchNavigationToCapi:', error)
     return { sent: false, error: error instanceof Error ? error.message : 'Unknown error' }
+  }
+}
+
+/**
+ * Fila de Reprocessamento (Retry): busca eventos com status 'failed' e tenta reenviar à Meta CAPI
+ */
+export async function retryFailedCapiEvents(workspaceId?: string, limit = 20) {
+  try {
+    const whereClause: {
+      status: string
+      retryCount: { lt: number }
+      workspaceId?: string
+    } = {
+      status: 'failed',
+      retryCount: { lt: 5 }
+    }
+    if (workspaceId) whereClause.workspaceId = workspaceId
+
+    const failedEvents = await prisma.trackingEvent.findMany({
+      where: whereClause,
+      include: { pixel: true },
+      take: limit,
+      orderBy: { createdAt: 'asc' }
+    })
+
+    let retried = 0
+    let succeeded = 0
+
+    for (const evt of failedEvents) {
+      if (!evt.pixel || !evt.pixel.accessTokenEnc) continue
+
+      let accessToken: string
+      try {
+        accessToken = decrypt(evt.pixel.accessTokenEnc)
+      } catch {
+        continue
+      }
+
+      retried++
+      const eventTime = Math.floor(new Date(evt.eventTime).getTime() / 1000)
+      const pixelEvent: PixelEvent = {
+        event_name: evt.eventName,
+        event_time: eventTime,
+        event_id: evt.eventId,
+        event_source_url: evt.sourceUrl || undefined,
+        action_source: 'website',
+        user_data: {
+          em: evt.emailHash ? [evt.emailHash] : undefined,
+          ph: evt.phoneHash ? [evt.phoneHash] : undefined,
+          fbp: evt.fbp || undefined,
+          fbc: evt.fbc || undefined,
+        },
+        custom_data: {
+          value: evt.value || undefined,
+          currency: evt.currency || undefined,
+          order_id: evt.orderId || undefined
+        }
+      }
+
+      const capiResult = await sendPixelEvents(
+        evt.pixel.pixelId,
+        accessToken,
+        [pixelEvent],
+        evt.pixel.testEventCode || undefined
+      )
+
+      const isSuccess = Boolean(
+        capiResult &&
+        capiResult.ok !== false &&
+        !capiResult.error &&
+        (typeof capiResult.events_received === 'number' ? capiResult.events_received > 0 : true)
+      )
+
+      if (isSuccess) {
+        succeeded++
+        await prisma.trackingEvent.update({
+          where: { id: evt.id },
+          data: {
+            status: 'sent',
+            sentAt: new Date(),
+            capiResponse: JSON.stringify(capiResult),
+            capiError: null
+          }
+        })
+      } else {
+        await prisma.trackingEvent.update({
+          where: { id: evt.id },
+          data: {
+            retryCount: { increment: 1 },
+            capiResponse: JSON.stringify(capiResult),
+            capiError: JSON.stringify(capiResult?.error || 'Retry falhou')
+          }
+        })
+      }
+    }
+
+    return { total: failedEvents.length, retried, succeeded }
+  } catch (error) {
+    console.error('[CAPI Service] Erro no retryFailedCapiEvents:', error)
+    return { total: 0, retried: 0, succeeded: 0, error: String(error) }
   }
 }
