@@ -1,0 +1,112 @@
+@import 'tailwindcss';
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+@theme {
+  --color-brand-blue: #0066FF;
+  --color-brand-cyan: #00D4FF;
+  --color-brand-accent: #39E6FF;
+  --color-brand-navy: #081A33;
+  --color-brand-midnight: #040A14;
+  --color-brand-surface: #0E2547;
+  --color-brand-border: #142C52;
+}
+
+:root {
+  --background: 248 250 252; /* Slate-50 clean background */
+  --foreground: 8 26 51; /* Official Navy #081A33 */
+  --card: 255 255 255;
+  --card-foreground: 8 26 51;
+  --primary: 0 102 255; /* Official Primary #0066FF */
+  --primary-foreground: 255 255 255;
+  --secondary: 0 212 255; /* Official Secondary #00D4FF */
+  --muted: 241 245 249;
+  --muted-foreground: 100 116 139;
+  --border: 226 232 240;
+  --ring: 0 102 255;
+  --font-inter: 'Inter', sans-serif;
+  --font-manrope: 'Manrope', sans-serif;
+}
+
+.dark {
+  --background: 4 10 20; /* Deep Midnight Navy #040A14 */
+  --foreground: 248 250 252;
+  --card: 8 26 51; /* Official Navy #081A33 */
+  --card-foreground: 248 250 252;
+  --primary: 0 102 255; /* Official Primary #0066FF */
+  --primary-foreground: 255 255 255;
+  --secondary: 0 212 255; /* Official Secondary #00D4FF */
+  --muted: 14 37 71; /* #0E2547 */
+  --muted-foreground: 148 163 184;
+  --border: 20 44 82; /* #142C52 */
+  --ring: 0 212 255;
+}
+
+body {
+  background-color: rgb(var(--background));
+  color: rgb(var(--foreground));
+  font-family: var(--font-inter), system-ui, -apple-system, sans-serif;
+}
+
+.dark body {
+  background-color: #040A14;
+  color: #F8FAFC;
+}
+
+h1, h2, h3, .font-display {
+  font-family: var(--font-manrope), var(--font-inter), system-ui, sans-serif;
+}
+
+* {
+  border-color: rgb(var(--border));
+}
+
+/* Seamless mapping to UTM-Track Official Brand Dark Palette */
+.dark .bg-gray-950,
+.dark .bg-slate-950 {
+  background-color: #040A14 !important;
+}
+
+.dark .bg-gray-900,
+.dark .bg-slate-900 {
+  background-color: #081A33 !important;
+}
+
+.dark .bg-gray-800,
+.dark .bg-slate-800 {
+  background-color: #0E2547 !important;
+}
+
+.dark .border-gray-800,
+.dark .border-slate-800,
+.dark .border-gray-700,
+.dark .border-slate-700 {
+  border-color: #142C52 !important;
+}
+
+.dark .hover\:bg-gray-800:hover,
+.dark .hover\:bg-slate-800:hover,
+.dark .hover\:bg-gray-900:hover {
+  background-color: #142C52 !important;
+}
+
+/* Glassmorphism & backdrop blur support for dark mode */
+.dark .backdrop-blur {
+  background-color: rgba(8, 26, 51, 0.85);
+}
+
+/* Scrollbar styling for dark mode */
+.dark ::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+.dark ::-webkit-scrollbar-track {
+  background: #040A14;
+}
+.dark ::-webkit-scrollbar-thumb {
+  background: #142C52;
+  border-radius: 4px;
+}
+.dark ::-webkit-scrollbar-thumb:hover {
+  background: #0066FF;
+}

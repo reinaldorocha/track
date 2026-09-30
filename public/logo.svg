@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 320 80" fill="none">
+  <defs>
+    <linearGradient id="logo_grad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#38bdf8" />
+      <stop offset="50%" stop-color="#0284c7" />
+      <stop offset="100%" stop-color="#2563eb" />
+    </linearGradient>
+  </defs>
+  <g transform="translate(8, 8)">
+    <rect x="0" y="0" width="64" height="64" rx="16" fill="#090d16" stroke="#1e293b" stroke-width="1.5" />
+    <path d="M14 46 L28 26 L36 36 L50 18" stroke="#38bdf8" stroke-width="2.5" stroke-linecap="round" stroke-opacity="0.6" />
+    <path d="M18 26 L32 16 L46 26 L46 38 L32 52 L18 38 Z" fill="url(#logo_grad)" />
+    <circle cx="32" cy="33" r="4.5" fill="#ffffff" />
+  </g>
+  <text x="86" y="46" font-family="system-ui, -apple-system, sans-serif" font-size="27" font-weight="800" fill="#0f172a">
+    UTM<tspan fill="#0284c7">-</tspan><tspan fill="#0284c7">Track</tspan>
+  </text>
+  <text x="88" y="61" font-family="system-ui, -apple-system, sans-serif" font-size="9" font-weight="600" letter-spacing="1.5" fill="#64748b">
+    ATRIBUIÇÃO &amp; GESTÃO
+  </text>
+</svg>

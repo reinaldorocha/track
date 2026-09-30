@@ -1,0 +1,823 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// ============================================================
+// AUTH & MULTI-TENANT
+// ============================================================
+
+model User {
+  id            String    @id @default(cuid())
+  name          String?
+  email         String    @unique
+  emailVerified DateTime?
+  image         String?
+  password      String?   // hashed with bcrypt
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  accounts      Account[]
+  sessions      Session[]
+  memberships   WorkspaceMember[]
+  devices       Device[]
+  notificationPreferences NotificationPreference[]
+}
+
+model Account {
+  id                String  @id @default(cuid())
+  userId            String
+  type              String
+  provider          String
+  providerAccountId String
+  refresh_token     String?
+  access_token      String?
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String?
+  session_state     String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  sessionToken String   @unique
+  userId       String
+  expires      DateTime
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+}
+
+model VerificationToken {
+  identifier String
+  token      String   @unique
+  expires    DateTime
+
+  @@unique([identifier, token])
+}
+
+model Workspace {
+  id        String   @id @default(cuid())
+  name      String
+  slug      String   @unique
+  logoUrl   String?
+  timezone  String   @default("America/Sao_Paulo")
+  currency  String   @default("BRL")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  members         WorkspaceMember[]
+  adAccounts      AdAccount[]
+  pixels          Pixel[]
+  utmLinks        UtmLink[]
+  trackingSessions TrackingSession[]
+  trackingEvents  TrackingEvent[]
+  sales           Sale[]
+  products        Product[]
+  integrations    Integration[]
+  webhookEndpoints WebhookEndpoint[]
+  expenses        Expense[]
+  fees            Fee[]
+  taxes           Tax[]
+  rules           Rule[]
+  notifications   Notification[]
+  devices         Device[]
+  notificationPreferences NotificationPreference[]
+  syncLogs        SyncLog[]
+  auditLogs       AuditLog[]
+  reports         Report[]
+}
+
+model WorkspaceMember {
+  id          String   @id @default(cuid())
+  workspaceId String
+  userId      String
+  role        String   @default("member") // owner, admin, member
+  createdAt   DateTime @default(now())
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([workspaceId, userId])
+}
+
+// ============================================================
+// META ADS HIERARCHY
+// ============================================================
+
+model AdAccount {
+  id               String   @id @default(cuid())
+  workspaceId      String
+  externalId       String   // Meta ad account ID (act_xxx)
+  name             String
+  currency         String   @default("BRL")
+  timezone         String   @default("America/Sao_Paulo")
+  status           String   @default("active") // active, inactive, error
+  accessTokenEnc   String?  // Encrypted user access token
+  metaUserId       String?  // Meta user who connected this
+  lastSyncAt       DateTime?
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  workspace   Workspace    @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  campaigns   Campaign[]
+  syncLogs    SyncLog[]
+
+  @@unique([workspaceId, externalId])
+}
+
+model Campaign {
+  id              String   @id @default(cuid())
+  workspaceId     String
+  adAccountId     String
+  externalId      String   // Meta campaign ID
+  name            String
+  status          String   @default("ACTIVE") // ACTIVE, PAUSED, DELETED, ARCHIVED
+  objective       String?
+  buyingType      String?
+  dailyBudget     Float?
+  lifetimeBudget  Float?
+  startTime       DateTime?
+  stopTime        DateTime?
+  lastSyncAt      DateTime?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  adAccount AdAccount @relation(fields: [adAccountId], references: [id], onDelete: Cascade)
+  adSets    AdSet[]
+  insights  CampaignInsight[]
+
+  @@unique([adAccountId, externalId])
+}
+
+model AdSet {
+  id                  String   @id @default(cuid())
+  workspaceId         String
+  campaignId          String
+  externalId          String   // Meta ad set ID
+  name                String
+  status              String   @default("ACTIVE")
+  dailyBudget         Float?
+  lifetimeBudget      Float?
+  optimizationGoal    String?
+  billingEvent        String?
+  bidAmount           Float?
+  startTime           DateTime?
+  endTime             DateTime?
+  lastSyncAt          DateTime?
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+
+  campaign Campaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  ads      Ad[]
+  insights AdSetInsight[]
+
+  @@unique([campaignId, externalId])
+}
+
+model Ad {
+  id          String   @id @default(cuid())
+  workspaceId String
+  adSetId     String
+  externalId  String   // Meta ad ID
+  name        String
+  status      String   @default("ACTIVE")
+  previewUrl  String?
+  creativeId  String?
+  lastSyncAt  DateTime?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  adSet    AdSet    @relation(fields: [adSetId], references: [id], onDelete: Cascade)
+  insights AdInsight[]
+  attributionRecords AttributionRecord[]
+
+  @@unique([adSetId, externalId])
+}
+
+// ============================================================
+// INSIGHTS (Stored daily snapshots from Meta API)
+// ============================================================
+
+model CampaignInsight {
+  id              String   @id @default(cuid())
+  campaignId      String
+  dateStart       DateTime
+  dateStop        DateTime
+  spend           Float    @default(0)
+  impressions     Int      @default(0)
+  reach           Int      @default(0)
+  clicks          Int      @default(0)
+  uniqueClicks    Int      @default(0)
+  ctr             Float    @default(0)
+  cpc             Float    @default(0)
+  cpm             Float    @default(0)
+  frequency       Float    @default(0)
+  conversions     Int      @default(0)
+  conversionValue Float    @default(0)
+  actions         String?  // JSON: raw actions array from Meta
+  createdAt       DateTime @default(now())
+
+  campaign Campaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+
+  @@unique([campaignId, dateStart, dateStop])
+}
+
+model AdSetInsight {
+  id              String   @id @default(cuid())
+  adSetId         String
+  dateStart       DateTime
+  dateStop        DateTime
+  spend           Float    @default(0)
+  impressions     Int      @default(0)
+  reach           Int      @default(0)
+  clicks          Int      @default(0)
+  ctr             Float    @default(0)
+  cpc             Float    @default(0)
+  cpm             Float    @default(0)
+  frequency       Float    @default(0)
+  conversions     Int      @default(0)
+  conversionValue Float    @default(0)
+  actions         String?
+  createdAt       DateTime @default(now())
+
+  adSet AdSet @relation(fields: [adSetId], references: [id], onDelete: Cascade)
+
+  @@unique([adSetId, dateStart, dateStop])
+}
+
+model AdInsight {
+  id              String   @id @default(cuid())
+  adId            String
+  dateStart       DateTime
+  dateStop        DateTime
+  spend           Float    @default(0)
+  impressions     Int      @default(0)
+  reach           Int      @default(0)
+  clicks          Int      @default(0)
+  ctr             Float    @default(0)
+  cpc             Float    @default(0)
+  cpm             Float    @default(0)
+  frequency       Float    @default(0)
+  conversions     Int      @default(0)
+  conversionValue Float    @default(0)
+  actions         String?
+  createdAt       DateTime @default(now())
+
+  ad Ad @relation(fields: [adId], references: [id], onDelete: Cascade)
+
+  @@unique([adId, dateStart, dateStop])
+}
+
+// ============================================================
+// META PIXEL
+// ============================================================
+
+model Pixel {
+  id              String   @id @default(cuid())
+  workspaceId     String
+  name            String
+  pixelId         String
+  accessTokenEnc  String?  // Encrypted CAPI access token
+  testEventCode   String?
+  status          String   @default("active") // active, inactive
+  environment     String   @default("production") // production, test
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  events    TrackingEvent[]
+
+  @@unique([workspaceId, pixelId])
+}
+
+// ============================================================
+// TRACKING
+// ============================================================
+
+model TrackingSession {
+  id              String   @id @default(cuid())
+  workspaceId     String
+  sessionId       String   @unique // client-generated UUID
+  visitorId       String?  // persistent across sessions
+  ipAddress       String?
+  userAgent       String?
+  // Meta identifiers
+  fbclid          String?
+  fbp             String?
+  fbc             String?
+  // UTM parameters
+  utmSource       String?
+  utmMedium       String?
+  utmCampaign     String?
+  utmContent      String?
+  utmTerm         String?
+  // Page context
+  landingPage     String?
+  referrer        String?
+  // Attribution fields
+  adId            String?
+  adSetId         String?
+  campaignId      String?
+  adAccountId     String?
+  firstSeenAt     DateTime @default(now())
+  lastSeenAt      DateTime @default(now())
+  createdAt       DateTime @default(now())
+
+  workspace  Workspace  @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  events     TrackingEvent[]
+  attributionRecords AttributionRecord[]
+
+  @@index([workspaceId, sessionId])
+  @@index([fbclid])
+  @@index([fbp])
+  @@index([utmCampaign])
+  @@index([workspaceId, firstSeenAt])
+}
+
+model TrackingEvent {
+  id              String   @id @default(cuid())
+  workspaceId     String
+  pixelId         String?
+  sessionId       String?
+  eventId         String   @unique // for deduplication
+  eventName       String   // PageView, Purchase, InitiateCheckout, etc.
+  eventTime       DateTime
+  sourceUrl       String?
+  // Event data
+  value           Float?
+  currency        String?
+  orderId         String?
+  contentIds      String?  // JSON array
+  contentType     String?
+  // User data (hashed when sent to Meta)
+  emailHash       String?
+  phoneHash       String?
+  fbclid          String?
+  fbp             String?
+  fbc             String?
+  // Status
+  status          String   @default("received") // received, sent, failed
+  capiResponse    String?  // JSON response from Meta CAPI
+  capiError       String?
+  sentAt          DateTime?
+  createdAt       DateTime @default(now())
+
+  workspace Workspace       @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  pixel     Pixel?          @relation(fields: [pixelId], references: [id])
+  session   TrackingSession? @relation(fields: [sessionId], references: [sessionId])
+
+  @@index([workspaceId, eventName])
+  @@index([workspaceId, createdAt])
+  @@index([orderId])
+}
+
+// ============================================================
+// UTM LINKS
+// ============================================================
+
+model UtmLink {
+  id           String   @id @default(cuid())
+  workspaceId  String
+  name         String?
+  destinationUrl String
+  utmSource    String?
+  utmMedium    String?
+  utmCampaign  String?
+  utmContent   String?
+  utmTerm      String?
+  // Meta dynamic parameters
+  adAccountId  String?
+  campaignId   String?
+  adSetId      String?
+  adId         String?
+  fullUrl      String   // generated full URL with UTMs
+  clicks       Int      @default(0)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  @@index([workspaceId])
+}
+
+// ============================================================
+// SALES (Normalized from all platforms)
+// ============================================================
+
+model Sale {
+  id              String   @id @default(cuid())
+  workspaceId     String
+  platform        String   // hotmart, yampi, shopify, cacto, generic
+  integrationId   String?
+  externalId      String   // Platform's order/transaction ID
+  externalRef     String?  // Secondary reference (e.g., transaction ID)
+  status          String   // approved, pending, refunded, chargeback, cancelled
+  // Financial
+  grossAmount     Float    @default(0) // Revenue before fees
+  netAmount       Float    @default(0) // After gateway fees
+  currency        String   @default("BRL")
+  // Attribution
+  utmSource       String?
+  utmMedium       String?
+  utmCampaign     String?
+  utmContent      String?
+  utmTerm         String?
+  fbclid          String?
+  fbp             String?
+  fbc             String?
+  sessionId       String?
+  // Customer (minimal, privacy-first)
+  customerEmail   String?  // hashed or omitted after attribution
+  // Timestamps
+  orderedAt       DateTime
+  approvedAt      DateTime?
+  refundedAt      DateTime?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  workspace         Workspace          @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  items             SaleItem[]
+  attributionRecord AttributionRecord?
+
+  @@unique([workspaceId, platform, externalId])
+  @@index([workspaceId, status])
+  @@index([workspaceId, orderedAt])
+  @@index([utmCampaign])
+  @@index([fbclid])
+}
+
+model SaleItem {
+  id         String  @id @default(cuid())
+  saleId     String
+  productId  String?
+  externalProductId String?
+  name       String
+  sku        String?
+  quantity   Int     @default(1)
+  unitPrice  Float
+  totalPrice Float
+
+  sale    Sale     @relation(fields: [saleId], references: [id], onDelete: Cascade)
+  product Product? @relation(fields: [productId], references: [id])
+}
+
+// ============================================================
+// PRODUCTS
+// ============================================================
+
+model Product {
+  id          String   @id @default(cuid())
+  workspaceId String
+  name        String
+  sku         String?
+  platform    String?  // hotmart, yampi, shopify, cacto
+  externalId  String?
+  price       Float?
+  cost        Float?   @default(0) // Product cost (COGS)
+  currency    String   @default("BRL")
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  workspace Workspace  @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  saleItems SaleItem[]
+  fees      ProductFee[]
+  taxes     ProductTax[]
+}
+
+// ============================================================
+// INTEGRATIONS
+// ============================================================
+
+model Integration {
+  id              String   @id @default(cuid())
+  workspaceId     String
+  platform        String   // hotmart, yampi, shopify, cacto
+  name            String
+  status          String   @default("inactive") // active, inactive, error, needs_reauth
+  configEnc       String?  // Encrypted JSON config (API keys, tokens)
+  webhookSecret   String?  // For validating incoming webhooks
+  lastSyncAt      DateTime?
+  lastEventAt     DateTime?
+  errorMessage    String?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  workspace      Workspace       @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  webhookEvents  WebhookEvent[]
+
+  @@unique([workspaceId, platform])
+}
+
+// ============================================================
+// WEBHOOKS
+// ============================================================
+
+model WebhookEndpoint {
+  id           String   @id @default(cuid())
+  workspaceId  String
+  name         String
+  endpointId   String   @unique // part of URL: /api/webhooks/generic/[endpointId]
+  secret       String   // HMAC secret
+  fieldMapping String?  // JSON: maps incoming fields to internal fields
+  isActive     Boolean  @default(true)
+  lastEventAt  DateTime?
+  eventCount   Int      @default(0)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  workspace Workspace      @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  events    WebhookEvent[]
+}
+
+model WebhookEvent {
+  id              String   @id @default(cuid())
+  workspaceId     String
+  integrationId   String?
+  endpointId      String?  // for generic webhooks
+  idempotencyKey  String   @unique // prevent duplicate processing
+  source          String   // hotmart, yampi, shopify, cacto, generic
+  eventType       String?  // e.g., PURCHASE, REFUND
+  status          String   @default("received") // received, processing, processed, failed
+  payload         String   // Raw JSON payload
+  processedData   String?  // Normalized JSON
+  errorMessage    String?
+  retryCount      Int      @default(0)
+  receivedAt      DateTime @default(now())
+  processedAt     DateTime?
+
+  integration     Integration?     @relation(fields: [integrationId], references: [id])
+  webhookEndpoint WebhookEndpoint? @relation(fields: [endpointId], references: [endpointId])
+
+  @@index([workspaceId, source])
+  @@index([workspaceId, status])
+  @@index([workspaceId, receivedAt])
+}
+
+// ============================================================
+// ATTRIBUTION
+// ============================================================
+
+model AttributionRecord {
+  id            String   @id @default(cuid())
+  workspaceId   String
+  saleId        String   @unique
+  sessionId     String?
+  adId          String?
+  adSetId       String?
+  campaignId    String?
+  adAccountId   String?
+  model         String   @default("last_click") // last_click, first_click, linear
+  confidence    Float    @default(1.0) // 0.0 - 1.0
+  matchedBy     String?  // fbclid, fbp, utm, session
+  fbclid        String?
+  utmCampaign   String?
+  createdAt     DateTime @default(now())
+
+  sale    Sale            @relation(fields: [saleId], references: [id], onDelete: Cascade)
+  session TrackingSession? @relation(fields: [sessionId], references: [sessionId])
+  ad      Ad?             @relation(fields: [adId], references: [id])
+
+  @@index([workspaceId, campaignId])
+  @@index([workspaceId, adId])
+}
+
+// ============================================================
+// FINANCIAL
+// ============================================================
+
+model Expense {
+  id          String   @id @default(cuid())
+  workspaceId String
+  name        String
+  category    String   // agency, tools, employees, domain, hosting, creatives, shipping, other
+  amount      Float
+  currency    String   @default("BRL")
+  date        DateTime
+  recurrence  String   @default("one_time") // one_time, monthly, yearly
+  productId   String?
+  notes       String?
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+}
+
+model Fee {
+  id           String   @id @default(cuid())
+  workspaceId  String
+  name         String
+  type         String   // gateway, checkout, platform, other
+  percentage   Float    @default(0) // e.g., 3.99 for 3.99%
+  fixedAmount  Float    @default(0) // fixed fee per transaction
+  productId    String?
+  platform     String?  // apply only to specific platform
+  isActive     Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+}
+
+model Tax {
+  id          String   @id @default(cuid())
+  workspaceId String
+  name        String
+  percentage  Float    // e.g., 6.0 for 6%
+  productId   String?
+  platform    String?
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+}
+
+model ProductFee {
+  id        String  @id @default(cuid())
+  productId String
+  feeId     String? // null = inline fee
+  name      String
+  type      String
+  percentage Float  @default(0)
+  fixedAmount Float @default(0)
+  isActive  Boolean @default(true)
+
+  product Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+}
+
+model ProductTax {
+  id        String  @id @default(cuid())
+  productId String
+  name      String
+  percentage Float
+
+  product Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+}
+
+// ============================================================
+// RULES
+// ============================================================
+
+model Rule {
+  id          String   @id @default(cuid())
+  workspaceId String
+  name        String
+  description String?
+  isActive    Boolean  @default(true)
+  conditions  String   // JSON: array of conditions
+  actions     String   // JSON: array of actions
+  priority    Int      @default(0)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+}
+
+// ============================================================
+// NOTIFICATIONS
+// ============================================================
+
+model Notification {
+  id             String    @id @default(cuid())
+  workspaceId    String
+  userId         String?
+  type           String    // sale_approved, pix_pending, sale_pending, refund, chargeback, alert, etc.
+  title          String
+  message        String
+  severity       String    @default("info") // info, warning, error, success
+  isRead         Boolean   @default(false)
+  readAt         DateTime?
+  amount         Float?
+  currency       String    @default("BRL")
+  platform       String?
+  product        String?
+  saleId         String?
+  orderId        String?
+  transactionId  String?
+  sound          String?
+  pushStatus     String?   @default("pending") // pending, sent, failed, skipped
+  idempotencyKey String?   @unique
+  metadata       String?   // JSON: additional context
+  createdAt      DateTime  @default(now())
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  @@index([workspaceId, isRead])
+  @@index([workspaceId, createdAt])
+  @@index([workspaceId, type])
+}
+
+model Device {
+  id          String   @id @default(cuid())
+  workspaceId String
+  userId      String?
+  token       String   @unique
+  platform    String   // android, ios, web
+  deviceName  String?
+  isActive    Boolean  @default(true)
+  lastSeenAt  DateTime @default(now())
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  user      User?     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([workspaceId, isActive])
+}
+
+model NotificationPreference {
+  id                String   @id @default(cuid())
+  workspaceId       String
+  userId            String
+  salesApproved     Boolean  @default(true)
+  salesPending      Boolean  @default(true)
+  pixGenerated      Boolean  @default(true)
+  refunds           Boolean  @default(true)
+  chargebacks       Boolean  @default(true)
+  systemAlerts      Boolean  @default(true)
+  integrationErrors Boolean  @default(true)
+  soundEnabled      Boolean  @default(true)
+  vibrationEnabled  Boolean  @default(true)
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([workspaceId, userId])
+}
+
+// ============================================================
+// SYNC LOGS
+// ============================================================
+
+model SyncLog {
+  id            String   @id @default(cuid())
+  workspaceId   String
+  adAccountId   String?
+  type          String   // meta_ads, webhooks, reconciliation
+  status        String   @default("running") // running, success, partial, failed
+  startedAt     DateTime @default(now())
+  finishedAt    DateTime?
+  itemsTotal    Int?
+  itemsProcessed Int?
+  itemsFailed   Int?
+  errorMessage  String?
+  details       String?  // JSON
+
+  workspace Workspace  @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  adAccount AdAccount? @relation(fields: [adAccountId], references: [id])
+
+  @@index([workspaceId, type])
+  @@index([workspaceId, startedAt])
+}
+
+// ============================================================
+// REPORTS
+// ============================================================
+
+model Report {
+  id          String   @id @default(cuid())
+  workspaceId String
+  name        String
+  type        String   // meta_ads, campaigns, sales, financial, utm, attribution
+  filters     String?  // JSON
+  columns     String?  // JSON: selected columns
+  createdAt   DateTime @default(now())
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+}
+
+// ============================================================
+// AUDIT
+// ============================================================
+
+model AuditLog {
+  id          String   @id @default(cuid())
+  workspaceId String
+  userId      String?
+  action      String   // create, update, delete, connect, disconnect
+  resource    String   // ad_account, pixel, integration, etc.
+  resourceId  String?
+  metadata    String?  // JSON
+  ipAddress   String?
+  createdAt   DateTime @default(now())
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  @@index([workspaceId, createdAt])
+}
