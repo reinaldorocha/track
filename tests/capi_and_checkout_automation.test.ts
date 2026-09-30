@@ -15,6 +15,7 @@ import {
   upsertSale
 } from '../src/lib/integrations/normalizer'
 import { attemptAttribution } from '../src/lib/tracking/attribution'
+import { POST as handleSessionPost } from '../src/app/api/tracking/session/route'
 import { dispatchPurchaseToCapi, dispatchNavigationToCapi, retryFailedCapiEvents, buildPurchaseEventId } from '../src/lib/meta/capi-service'
 import { sendPixelEvents } from '../src/lib/meta/pixel'
 import { decorateCheckoutUrl, isCheckoutUrl } from '../src/lib/tracking/checkout-decorator'
@@ -1849,7 +1850,7 @@ describe('Automação CAPI, Decoração Real de Checkout, Roteamento por Produto
     }) {
       const mockStorage = { ...(options.localStorageData || {}) }
       const mockSession = { ...(options.sessionStorageData || {}) }
-      const sentBeacons: Array<{ url: string; data: any }> = []
+      const sentBeacons: Array<{ url: string; data: any; rawText?: string }> = []
       const sentFetches: Array<{ url: string; data: any }> = []
 
       const scriptAttrs: Record<string, string> = {
@@ -1929,7 +1930,8 @@ describe('Automação CAPI, Decoração Real de Checkout, Roteamento por Produto
         navigator: {
           userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
           sendBeacon: (url: string, data: any) => {
-            sentBeacons.push({ url, data })
+            const rawText = data?.payloadText || (typeof data === 'string' ? data : '')
+            sentBeacons.push({ url, data, rawText })
             return true
           }
         },
@@ -1960,7 +1962,14 @@ describe('Automação CAPI, Decoração Real de Checkout, Roteamento por Produto
         String: String,
         JSON: JSON,
         console: console,
-        Blob: globalThis.Blob,
+        Blob: class MockBlob {
+          public payloadText: string
+          constructor(parts: any[]) {
+            this.payloadText = Array.isArray(parts) ? parts.join('') : String(parts || '')
+          }
+          async text() { return this.payloadText }
+          toString() { return this.payloadText }
+        },
         fetch: async (url: string, opts: any) => {
           sentFetches.push({ url, data: opts?.body })
           return { ok: true, json: async () => ({ success: true }) }
@@ -2102,35 +2111,151 @@ describe('Automação CAPI, Decoração Real de Checkout, Roteamento por Produto
       assert.equal(attribution1.utmCampaign, 'blackfriday', 'Atribuição vinculada à campanha A')
 
       // -------------------------------------------------------------------------
-      // CENÁRIO 2: A -> B -> Compra (Substituição Atômica)
+      // CENÁRIO 2: A -> B -> Compra (Mesma Aba, mesmo sessionStorage e Endpoint Real)
       // -------------------------------------------------------------------------
+      // Visita 1 (Campanha A)
+      const domA = [
+        { tag: 'a', attrs: { href: 'https://pay.kiwify.com.br/checkout_a' } }
+      ]
       const visitA = runTrackerInVm({
-        url: 'https://meusite.com.br/?utm_source=facebook&utm_campaign=ad_a&utm_content=video1'
+        url: 'https://meusite.com.br/?utm_source=facebook&utm_campaign=ad_a&utm_content=video1',
+        domElements: domA
       })
       assert.equal(visitA.utmTrack.utms.campaign, 'ad_a')
+      const sessIdA = visitA.utmTrack.sessionId
 
+      // Chamar endpoint real /api/tracking/session com os dados da visita A
+      const rawBeaconA = visitA.sentBeacons[0]?.rawText || visitA.sentFetches[0]?.data
+      const parsedBeaconA = typeof rawBeaconA === 'string' && rawBeaconA ? JSON.parse(rawBeaconA) : {}
+      const reqA = new Request('https://track.test/api/tracking/session', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ...parsedBeaconA, workspaceId: testWorkspaceId })
+      })
+      const resA = await handleSessionPost(reqA)
+      assert.equal(resA.status, 200, 'Endpoint real de sessão gravou sessão A com sucesso')
+
+      const dbSessA = await prisma.trackingSession.findUnique({
+        where: { sessionId: sessIdA }
+      })
+      assert.ok(dbSessA, 'Sessão A criada no banco')
+      assert.equal(dbSessA.utmCampaign, 'ad_a', 'Sessão A gravada com campanha ad_a')
+
+      // Visita 2 (Campanha B) NA MESMA ABA:
+      // Passa o MESMO sessionStorageData contendo o _utmt_sid e _utmt_utm da visita A!
       const domB = [
         { tag: 'a', attrs: { href: 'https://pay.kiwify.com.br/checkout_b' } }
       ]
       const visitB = runTrackerInVm({
         url: 'https://meusite.com.br/?utm_source=google&utm_campaign=ad_b&utm_medium=cpc',
         localStorageData: visitA.mockStorage,
+        sessionStorageData: visitA.mockSession, // Mesma aba! sessionStorage preservado
         domElements: domB
       })
+
+      // O tracker DEVE detectar a troca de campanha e gerar uma NOVA sessão para B
+      assert.equal(visitB.utmTrack.visitorId, visitA.utmTrack.visitorId, 'Mesmo visitante persistente')
+      assert.notEqual(visitB.utmTrack.sessionId, sessIdA, 'Troca de campanha na mesma aba DEVE gerar novo sessionId')
+      const sessIdB = visitB.utmTrack.sessionId
 
       assert.equal(visitB.utmTrack.utms.source, 'google', 'Visita B: source deve ser google')
       assert.equal(visitB.utmTrack.utms.campaign, 'ad_b', 'Visita B: campaign deve ser ad_b')
       assert.equal(visitB.utmTrack.utms.medium, 'cpc', 'Visita B: medium deve ser cpc')
       assert.equal(visitB.utmTrack.utms.content, null, 'Visita B: content deve ser null (NÃO herda video1 de A)')
 
-      const storedB = JSON.parse(visitB.mockStorage['_utmt_campaign'])
-      assert.equal(storedB.utms.campaign, 'ad_b', 'Storage deve estar atualizado com ad_b')
-      assert.equal(storedB.utms.content, null, 'Storage não deve conter content de A')
+      // Chamar endpoint real /api/tracking/session para a sessão B
+      const rawBeaconB = visitB.sentBeacons[0]?.rawText || visitB.sentFetches[0]?.data
+      const parsedBeaconB = typeof rawBeaconB === 'string' && rawBeaconB ? JSON.parse(rawBeaconB) : {}
+      const reqB = new Request('https://track.test/api/tracking/session', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ...parsedBeaconB, workspaceId: testWorkspaceId })
+      })
+      const resB = await handleSessionPost(reqB)
+      assert.equal(resB.status, 200, 'Endpoint real de sessão gravou sessão B com sucesso')
 
+      // Verificar que o banco preservou AMBAS as sessões com suas respectivas origens intactas!
+      const dbSessA_after = await prisma.trackingSession.findUnique({
+        where: { sessionId: sessIdA }
+      })
+      assert.equal(dbSessA_after?.utmCampaign, 'ad_a', 'Histórico de A preservado no banco (não foi sobrescrito por B)')
+
+      const dbSessB = await prisma.trackingSession.findUnique({
+        where: { sessionId: sessIdB }
+      })
+      assert.equal(dbSessB?.utmCampaign, 'ad_b', 'Sessão B gravada no banco com ad_b')
+
+      // Verificar link de checkout em B decorado com novo sessionId de B
       const decoratedLinkB = String(domB[0]?.attrs['href'] || '')
+      assert.ok(decoratedLinkB.includes(`_utmt_sid=${sessIdB}`), 'Checkout B decorado com a nova sessionId de B')
       assert.ok(decoratedLinkB.includes('utm_source=google'), 'Checkout B tem utm_source=google')
       assert.ok(decoratedLinkB.includes('utm_campaign=ad_b'), 'Checkout B tem utm_campaign=ad_b')
       assert.ok(!decoratedLinkB.includes('video1'), 'Checkout B NÃO deve conter utm_content=video1')
+
+      // Simular compra via webhook trazendo APENAS o sessionId de B (sem UTMs no payload do webhook)
+      const saleResultB = await upsertSale({
+        workspaceId: testWorkspaceId,
+        platform: 'kiwify',
+        externalId: `SALE_B_SAMETAB_${Date.now()}`,
+        status: 'approved',
+        grossAmount: 297,
+        netAmount: 270,
+        currency: 'BRL',
+        customerEmail: 'comprador.b@exemplo.com',
+        sessionId: sessIdB, // Somente o sessionId retornado pelo checkout decorado!
+        orderedAt: new Date()
+      })
+
+      // upsertSale recupera B (e não A!) a partir da sessão correta no mesmo workspace
+      assert.equal(saleResultB.utmCampaign, 'ad_b', 'Venda deve recuperar ad_b da nova sessão e NÃO ad_a')
+      assert.equal(saleResultB.utmSource, 'google')
+
+      const attributionB = await attemptAttribution(saleResultB.id)
+      assert.ok(attributionB, 'Atribuição gerada com sucesso')
+      assert.equal(attributionB.matchedBy, 'session')
+      assert.equal(attributionB.confidence, 1.0)
+      assert.equal(attributionB.utmCampaign, 'ad_b', 'Atribuído à campanha B')
+
+      // -------------------------------------------------------------------------
+      // CENÁRIO 2.1: Isolamento estrito de Workspace em upsertSale e attemptAttribution
+      // -------------------------------------------------------------------------
+      const foreignWs = await prisma.workspace.create({
+        data: { name: 'Foreign Workspace', slug: `foreign-${Date.now()}` }
+      })
+      const foreignSessId = `foreign_sess_${Date.now()}`
+      await prisma.trackingSession.create({
+        data: {
+          sessionId: foreignSessId,
+          workspaceId: foreignWs.id,
+          utmSource: 'foreign_source',
+          utmCampaign: 'foreign_campaign',
+          firstSeenAt: new Date(),
+          lastSeenAt: new Date()
+        }
+      })
+
+      // Venda criada no testWorkspaceId tentando referenciar a foreignSessId de outro workspace
+      const crossSale = await upsertSale({
+        workspaceId: testWorkspaceId,
+        platform: 'kiwify',
+        externalId: `CROSS_SALE_${Date.now()}`,
+        status: 'approved',
+        grossAmount: 99,
+        netAmount: 90,
+        currency: 'BRL',
+        sessionId: foreignSessId,
+        orderedAt: new Date()
+      })
+
+      // Não deve herdar os dados da sessão do outro workspace
+      assert.ok(!crossSale.utmCampaign, 'upsertSale NÃO deve adotar sessão de outro workspace')
+      const crossAttribution = await attemptAttribution(crossSale.id)
+      assert.equal(crossAttribution, null, 'attemptAttribution NÃO deve atribuir a sessão de outro workspace')
+
+      // Limpar foreignWs
+      await prisma.trackingSession.deleteMany({ where: { workspaceId: foreignWs.id } })
+      await prisma.sale.deleteMany({ where: { workspaceId: foreignWs.id } })
+      await prisma.workspace.delete({ where: { id: foreignWs.id } })
 
       // -------------------------------------------------------------------------
       // CENÁRIO 3: Campanha expirada (> 30 dias) -> Retorno Direto

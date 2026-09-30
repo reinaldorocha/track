@@ -11,10 +11,10 @@ export async function attemptAttribution(saleId: string) {
   let session = null
   let matchedBy = ''
   
-  // 1. Match direto por sessionId (sessão exata que originou o checkout decorado)
+  // 1. Match direto por sessionId no workspace da venda
   if (sale.sessionId) {
-    session = await prisma.trackingSession.findUnique({
-      where: { sessionId: sale.sessionId }
+    session = await prisma.trackingSession.findFirst({
+      where: { sessionId: sale.sessionId, workspaceId: sale.workspaceId }
     })
     if (session) matchedBy = 'session'
   }

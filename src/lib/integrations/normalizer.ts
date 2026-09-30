@@ -546,8 +546,8 @@ export async function upsertSale(sale: InternalSale) {
   // Hidratar UTMs e identificadores a partir da TrackingSession correspondente daquela sessão
   if (sale.sessionId && (!sale.utmSource || !sale.utmCampaign)) {
     try {
-      const session = await prisma.trackingSession.findUnique({
-        where: { sessionId: sale.sessionId }
+      const session = await prisma.trackingSession.findFirst({
+        where: { sessionId: sale.sessionId, workspaceId: sale.workspaceId }
       })
       if (session) {
         sale.utmSource = sale.utmSource || session.utmSource || undefined

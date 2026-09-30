@@ -112,11 +112,50 @@
     setCookie('_fbc', fbc, 90);
   }
   
-  var sessionId = getOrCreateId('_utmt_sid', false); // 30min session
-  var visitorId = getOrCreateId('_utmt_vid', true);  // persistent localStorage
-  
+  function isSameCampaign(a, b) {
+    if (!a && !b) return true;
+    if (!a || !b) return false;
+    return (
+      (a.source || null) === (b.source || null) &&
+      (a.campaign || null) === (b.campaign || null) &&
+      (a.medium || null) === (b.medium || null) &&
+      (a.content || null) === (b.content || null) &&
+      (a.term || null) === (b.term || null)
+    );
+  }
+
   var STORAGE_KEY_CAMPAIGN = '_utmt_campaign';
   var STORAGE_KEY_SESSION_UTM = '_utmt_utm';
+
+  // Obter campanha ativa da sessão anterior nesta aba (se houver)
+  var currentSessionUtms = null;
+  try {
+    if (typeof sessionStorage !== 'undefined') {
+      var rawSessUtm = sessionStorage.getItem(STORAGE_KEY_SESSION_UTM);
+      if (rawSessUtm) {
+        currentSessionUtms = JSON.parse(rawSessUtm);
+      }
+    }
+  } catch(e) {}
+
+  // Verifica se houve troca de campanha (mesmo dentro da mesma aba)
+  var isCampaignChange = hasCampaignInUrl && !isSameCampaign(rawUtms, currentSessionUtms);
+
+  var visitorId = getOrCreateId('_utmt_vid', true);  // persistent localStorage
+  var sessionId = null;
+
+  if (isCampaignChange) {
+    // Ao mudar de campanha, gerar uma NOVA sessão vinculada ao mesmo visitante,
+    // preservando o histórico da campanha anterior no banco e apontando os checkouts para a nova campanha.
+    sessionId = Date.now().toString(36) + Math.random().toString(36).substr(2);
+    try {
+      if (typeof sessionStorage !== 'undefined') {
+        sessionStorage.setItem('_utmt_sid', sessionId);
+      }
+    } catch(e) {}
+  } else {
+    sessionId = getOrCreateId('_utmt_sid', false); // 30min session
+  }
 
   var utms = {
     source: null,

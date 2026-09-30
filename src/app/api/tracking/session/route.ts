@@ -56,7 +56,17 @@ export async function POST(req: Request) {
         lastSeenAt: new Date()
       },
       update: {
-        lastSeenAt: new Date()
+        lastSeenAt: new Date(),
+        ...(utmSource !== undefined ? { utmSource } : {}),
+        ...(utmMedium !== undefined ? { utmMedium } : {}),
+        ...(utmCampaign !== undefined ? { utmCampaign } : {}),
+        ...(utmContent !== undefined ? { utmContent } : {}),
+        ...(utmTerm !== undefined ? { utmTerm } : {}),
+        ...(fbclid !== undefined ? { fbclid } : {}),
+        ...(fbc !== undefined ? { fbc } : {}),
+        ...(landingPage !== undefined ? { landingPage } : {}),
+        ...(referrer !== undefined ? { referrer } : {}),
+        ...(userAgent !== undefined ? { userAgent } : {})
       }
     })
 
